@@ -1,5 +1,7 @@
 # delphi-mcp-forms
 
+**English** · [Italiano](README.it.md)
+
 **WebMCP-style tools for Delphi desktop apps (VCL and FireMonkey), served over the Model Context Protocol.**
 
 [WebMCP](https://developer.chrome.com/docs/ai/webmcp) is a proposed web standard. A web page uses it to tell an in-browser AI agent which actions it offers: a JavaScript function registered with `registerTool()`, or an HTML `<form>` annotated with `toolname` and `tooldescription`. delphi-mcp-forms brings the same model to Delphi forms:
