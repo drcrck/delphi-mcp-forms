@@ -197,13 +197,6 @@ Third-party or custom controls are added with `RegisterMCPControlAdapter`: subcl
 
 Build them with `build.bat`, or open the `.dpr` files in the IDE.
 
-## Related projects
-
-- [GDKsoftware/Delphi-MCP-Server](https://github.com/GDKsoftware/Delphi-MCP-Server): a complete MCP server framework for Delphi, with STDIO and HTTP transports, resources and OAuth.
-- [JavierusTk/DelphiMCP](https://github.com/JavierusTk/DelphiMCP): generic UI automation of VCL apps (click, type, screenshot).
-
-delphi-mcp-forms takes a different approach. Instead of letting an agent drive the UI control by control, the application **declares** the actions it offers, the way a web page does with WebMCP.
-
 ## License
 
 MIT, see [LICENSE](LICENSE).

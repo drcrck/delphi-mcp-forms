@@ -199,13 +199,6 @@ I controlli di terze parti o personalizzati si aggiungono con `RegisterMCPContro
 
 Si compilano con `build.bat`, oppure aprendo i file `.dpr` nell'IDE.
 
-## Progetti correlati
-
-- [GDKsoftware/Delphi-MCP-Server](https://github.com/GDKsoftware/Delphi-MCP-Server): un framework completo per server MCP in Delphi, con trasporti STDIO e HTTP, risorse e OAuth.
-- [JavierusTk/DelphiMCP](https://github.com/JavierusTk/DelphiMCP): automazione generica della UI di app VCL (clic, digitazione, screenshot).
-
-delphi-mcp-forms segue un approccio diverso: invece di lasciare che un agente guidi la UI controllo per controllo, è l'applicazione a **dichiarare** le azioni che offre, come fa una pagina web con WebMCP.
-
 ## Licenza
 
 MIT, vedi [LICENSE](LICENSE).
