@@ -1,0 +1,14 @@
+bin/
+dcu/
+__history/
+__recovery/
+*.dcu
+*.exe
+*.local
+*.identcache
+*.stat
+*.dsk
+*.res
+*.dproj.local
+Win32/
+Win64/
