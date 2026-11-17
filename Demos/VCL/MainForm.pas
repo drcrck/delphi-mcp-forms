@@ -9,7 +9,8 @@ interface
 uses
   System.SysUtils, System.Classes, System.JSON,
   Vcl.Controls, Vcl.Forms, Vcl.StdCtrls, Vcl.ComCtrls, Vcl.Samples.Spin, Vcl.Dialogs,
-  MCPForms.Core, MCPForms.VCL, MCPForms.Transport.HTTP, MCPForms.Transport.WinMsg;
+  MCPForms.Core, MCPForms.VCL, MCPForms.Screen, MCPForms.Transport.HTTP,
+  MCPForms.Transport.WinMsg;
 
 type
   TfrmMain = class(TForm)
@@ -98,10 +99,18 @@ begin
   FServer.Free;
   ModelContext.UnregisterTool('list-orders');
   ModelContext.UnregisterTool('delete-order');
+  ModelContext.UnregisterTool('read-screen');
 end;
 
 procedure TfrmMain.RegisterImperativeTools;
 begin
+  // What the user sees: every field of the active window with its value,
+  // as a tool (read-screen) and as resources (form://active, form://<name>)
+  // that clients can subscribe to.
+  MCPRegisterReadScreenTool;
+  MCPRegisterFormResources;
+  MCPIgnoreScreenControl(memLog); // the log is not the user's data
+
   ModelContext.RegisterTool('list-orders',
     'List the saved orders, one per line, with their numbers.',
     TMCPSchema.Empty,

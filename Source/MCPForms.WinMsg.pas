@@ -9,6 +9,9 @@ unit MCPForms.WinMsg;
     Reply    server -> client: WM_COPYDATA to the reply window, wParam = server
              window, same dwData, lpData = the JSON-RPC response (UTF-8).
              Empty data means "no response" (the request was a notification).
+    Notify   server -> client: WM_COPYDATA to a reply window that has sent
+             requests, dwData = 0 (MCPWinMsgNotifyId), lpData = a JSON-RPC
+             notification (tools/list_changed, resources/updated...).
 
   Replies are asynchronous because a tool call can wait minutes for the user;
   several requests can be in flight at once.
@@ -29,6 +32,8 @@ const
   MCPWinMsgClientClass = 'MCPFormsClientWindow';
   MCPWinMsgTitlePrefix = 'MCPForms:';
   MCPWinMsgMaxSize = 16 * 1024 * 1024;
+  /// dwData of a message the server sends on its own (a notification).
+  MCPWinMsgNotifyId = 0;
 
 type
   EMCPWinMsgError = class(Exception);
@@ -41,12 +46,15 @@ type
 
   /// Called on the client's thread while it processes messages.
   TMCPReplyProc = reference to procedure(Id: NativeUInt; const Reply: string);
+  /// A notification from the server. Same thread as TMCPReplyProc.
+  TMCPNotificationProc = reference to procedure(const Notification: string);
 
   TMCPWinMsgClient = class
   private
     FWnd: HWND;
     FServer: HWND;
     FOnReply: TMCPReplyProc;
+    FOnNotification: TMCPNotificationProc;
     FWaitId: NativeUInt;
     FWaitReply: string;
     FWaitDone: Boolean;
@@ -75,6 +83,8 @@ type
     property Server: HWND read FServer write FServer;
     property Handle: HWND read FWnd;
     property OnReply: TMCPReplyProc read FOnReply write FOnReply;
+    /// Server notifications. When not assigned they go to OnReply with Id 0.
+    property OnNotification: TMCPNotificationProc read FOnNotification write FOnNotification;
   end;
 
 { Helpers shared with MCPForms.Transport.WinMsg }
@@ -206,7 +216,9 @@ begin
   // only our server may answer
   if (FServer <> 0) and (Sender <> FServer) then
     Exit;
-  if (FWaitId <> 0) and (Id = FWaitId) then
+  if (Id = MCPWinMsgNotifyId) and Assigned(FOnNotification) then
+    FOnNotification(Text)
+  else if (FWaitId <> 0) and (Id = FWaitId) then
   begin
     FWaitReply := Text;
     FWaitDone := True;

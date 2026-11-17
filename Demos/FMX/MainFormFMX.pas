@@ -11,7 +11,8 @@ uses
   FMX.Types, FMX.Controls, FMX.Forms, FMX.StdCtrls, FMX.Edit, FMX.EditBox,
   FMX.SpinBox, FMX.ListBox, FMX.DateTimeCtrls, FMX.Memo, FMX.Layouts,
   FMX.Controls.Presentation, FMX.ScrollBox,
-  MCPForms.Core, MCPForms.FMX, MCPForms.Transport.HTTP, MCPForms.Transport.WinMsg;
+  MCPForms.Core, MCPForms.FMX, MCPForms.Screen, MCPForms.Transport.HTTP,
+  MCPForms.Transport.WinMsg;
 
 type
   TFormMain = class(TForm)
@@ -99,10 +100,13 @@ begin
   FBook := TButton.Create(Self);
   FBook.Parent := FBooking;
   FBook.SetBounds(280, 240, 100, 30);
+  FBook.Name := 'btnBook';
   FBook.Text := 'Book';
   FBook.OnClick := BookClick;
 
   FBookings := TListBox.Create(Self);
+  FBookings.Name := 'lstBookings'; // named: the screen snapshots read it
+  FBookings.Hint := 'Bookings made';
   FBookings.Parent := Self;
   FBookings.SetBounds(430, 12, 318, 290);
 
@@ -142,6 +146,11 @@ begin
       if Result = '' then
         Result := 'No bookings yet.';
     end);
+  // What the user sees: every field of the active window with its value,
+  // as a tool (read-screen) and as resources (form://active, form://<name>)
+  // that clients can subscribe to.
+  MCPRegisterReadScreenTool;
+  MCPRegisterFormResources;
 
   FServer := TMCPHttpServer.Create(8766);
   FServer.Start;
@@ -156,6 +165,7 @@ begin
   FWinMsg.Free;
   FServer.Free;
   ModelContext.UnregisterTool('list-bookings');
+  ModelContext.UnregisterTool('read-screen');
 end;
 
 procedure TFormMain.BookClick(Sender: TObject);

@@ -5,9 +5,12 @@ unit MCPForms.Core;
   Protocol (MCP).
 
   This unit has no VCL/FMX dependency. It holds the tool registry (the Delphi
-  counterpart of WebMCP's document.modelContext), a JSON Schema builder and the
-  MCP JSON-RPC dispatcher. Transports (see MCPForms.Transport.HTTP) only move
-  strings in and out of TModelContext.HandleMessage.
+  counterpart of WebMCP's document.modelContext), the resource providers, a
+  JSON Schema builder and the MCP JSON-RPC dispatcher. Transports (see
+  MCPForms.Transport.HTTP) only move strings in and out of
+  TModelContext.HandleMessage; those that can also carry messages from the
+  server to the client pass an IMCPSession, and then get notifications:
+  tools/list_changed, resources/list_changed and resources/updated.
 
   MIT License - see LICENSE. }
 
@@ -100,6 +103,35 @@ type
     function Wait(TimeoutMs: Cardinal): string;
   end;
 
+  /// One resource, as resources/list shows it.
+  TMCPResourceInfo = record
+    Uri: string;
+    Name: string;
+    Title: string;
+    Description: string;
+    MimeType: string;
+  end;
+
+  /// A set of resources that can change while the application runs (e.g. its
+  /// open windows). Both methods run on the main thread.
+  IMCPResourceProvider = interface
+    ['{3B8E6A21-9C4F-4D7A-B5E2-1F0C8D6A4E93}']
+    function ListResources: TArray<TMCPResourceInfo>;
+    /// False when Uri is not one of this provider's resources.
+    function ReadResource(const Uri: string; out MimeType, Text: string): Boolean;
+  end;
+
+  /// A client connection that can receive messages from the server. A
+  /// transport implements it for each connected client and passes it to
+  /// HandleMessage.
+  IMCPSession = interface
+    ['{9D2C4F7B-1E6A-4B83-A0D5-7C3E9F1B2A64}']
+    /// Delivers one JSON-RPC message (a notification). Any thread.
+    procedure Send(const MessageJSON: string);
+    /// False once the client is gone: the session is then dropped.
+    function Alive: Boolean;
+  end;
+
   TMCPLogProc = reference to procedure(const Msg: string);
   /// Asked on the main thread before a tool with ConsequentialHint runs.
   TMCPConfirmFunc = reference to function(const Tool: IMCPTool; const Args: TJSONObject): Boolean;
@@ -140,11 +172,26 @@ type
     FConfirmHandler: TMCPConfirmFunc;
     FOnLog: TMCPLogProc;
     FOnToolChange: TProc;
+    FToolChangeListeners: TDictionary<Integer, TProc>;
+    FNextListenerId: Integer;
     FMainThreadTimeout: Cardinal;
+    FProviders: TList<TPair<Integer, IMCPResourceProvider>>;
+    FNextProviderId: Integer;
+    FSessions: TObjectList<TObject>; // TMCPSessionState
+    FWatcher: TThread;
+    FResourcePollInterval: Cardinal;
+    function FindState(const Session: IMCPSession): TObject;
+    procedure SendToSessions(const MessageJSON: string; const OnlyUri: string = '');
+    function HasLiveSessions: Boolean;
+    function SubscribedUris: TArray<string>;
+    function HandleResourcesList: TJSONObject;
+    function HandleResourcesRead(Params: TJSONObject): TJSONObject;
+    function HandleSubscribe(Params: TJSONObject; const Session: IMCPSession;
+      Subscribe: Boolean): TJSONObject;
     function FindTool(const Name: string): IMCPTool;
     procedure ToolsChanged;
     function ErrorResponse(Id: TJSONValue; Code: Integer; const Msg: string): string;
-    function HandleInitialize(Params: TJSONObject): TJSONObject;
+    function HandleInitialize(Params: TJSONObject; WithSession: Boolean): TJSONObject;
     function HandleToolsList: TJSONObject;
     function HandleToolsCall(Params: TJSONObject): TJSONObject;
     function ToolToJSON(const Tool: IMCPTool): TJSONObject;
@@ -170,7 +217,32 @@ type
     /// The whole MCP endpoint as a function: one JSON-RPC message in, the
     /// response out ('' for notifications). Call it from a worker thread:
     /// tools that wait for the user would block the main thread otherwise.
-    function HandleMessage(const RequestJSON: string): string;
+    /// Session: the connection the message came from, when the transport can
+    /// send it notifications (it is attached on first use).
+    function HandleMessage(const RequestJSON: string;
+      const Session: IMCPSession = nil): string;
+
+    /// Sessions receive notifications until they are detached or not Alive.
+    procedure AttachSession(const Session: IMCPSession);
+    procedure DetachSession(const Session: IMCPSession);
+
+    /// resources/list and resources/read are answered by the providers, in
+    /// registration order. Returns an id for UnregisterResourceProvider.
+    function RegisterResourceProvider(const Provider: IMCPResourceProvider): Integer;
+    procedure UnregisterResourceProvider(Id: Integer);
+    /// All resources of all providers. Any thread.
+    function ListResources: TArray<TMCPResourceInfo>;
+    /// Text of a resource. Any thread. Raises EMCPProtocolError -32002 when
+    /// no provider knows Uri.
+    function ReadResource(const Uri: string; out MimeType: string): string;
+
+    /// Sends a notification to every initialized session. Takes Params.
+    procedure Notify(const Method: string; Params: TJSONObject = nil);
+    /// The list of resources changed (notifications/resources/list_changed).
+    /// Not needed for changes the poller sees.
+    procedure ResourcesChanged;
+    /// A resource changed (notifications/resources/updated to its subscribers).
+    procedure ResourceUpdated(const Uri: string);
 
     /// Runs Func on the main thread and returns its result. Direct call when
     /// already on the main thread.
@@ -184,12 +256,22 @@ type
     property ServerVersion: string read FServerVersion write FServerVersion;
     /// Optional text sent to the client in the initialize result.
     property Instructions: string read FInstructions write FInstructions;
+    /// Like OnToolChange, for more than one listener (e.g. a transport that
+    /// notifies its clients). Called from any thread. Returns an id for
+    /// RemoveToolChangeListener.
+    function AddToolChangeListener(const Listener: TProc): Integer;
+    procedure RemoveToolChangeListener(Id: Integer);
+
     property ConfirmHandler: TMCPConfirmFunc read FConfirmHandler write FConfirmHandler;
     /// Called from any thread.
     property OnLog: TMCPLogProc read FOnLog write FOnLog;
     /// Called (from any thread) after a tool is registered or unregistered.
     property OnToolChange: TProc read FOnToolChange write FOnToolChange;
     property MainThreadTimeout: Cardinal read FMainThreadTimeout write FMainThreadTimeout;
+    /// While a session is connected, the resource list and the subscribed
+    /// resources are read every ResourcePollInterval ms (on the main thread)
+    /// and the changes are notified. 0 turns polling off. Default 1000.
+    property ResourcePollInterval: Cardinal read FResourcePollInterval write FResourcePollInterval;
   end;
 
 /// The process-wide registry, like document.modelContext.
@@ -199,6 +281,9 @@ function ModelContext: TModelContext;
 function MCPIsValidToolName(const Name: string): Boolean;
 
 implementation
+
+uses
+  System.StrUtils;
 
 { EMCPProtocolError }
 
@@ -390,6 +475,160 @@ begin
   Result := FText;
 end;
 
+{ Sessions and the resource watcher }
+
+type
+  TMCPSessionState = class
+  public
+    Session: IMCPSession;
+    Initialized: Boolean;
+    Subscriptions: TStringList;
+    constructor Create(const ASession: IMCPSession);
+    destructor Destroy; override;
+  end;
+
+  /// Reads the resource list and the subscribed resources every
+  /// ResourcePollInterval ms and notifies what changed.
+  TMCPResourceWatcher = class(TThread)
+  private
+    FContext: TModelContext;
+    FWake: TEvent;
+    FLastList: string;
+    FHaveList: Boolean;
+    FLast: TDictionary<string, string>;
+    procedure Poll;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AContext: TModelContext);
+    destructor Destroy; override;
+    procedure Stop;
+  end;
+
+constructor TMCPSessionState.Create(const ASession: IMCPSession);
+begin
+  inherited Create;
+  Session := ASession;
+  Subscriptions := TStringList.Create;
+  Subscriptions.Sorted := True;
+  Subscriptions.Duplicates := dupIgnore;
+  Subscriptions.CaseSensitive := True;
+end;
+
+destructor TMCPSessionState.Destroy;
+begin
+  Subscriptions.Free;
+  inherited;
+end;
+
+constructor TMCPResourceWatcher.Create(AContext: TModelContext);
+begin
+  FContext := AContext;
+  FWake := TEvent.Create(nil, False, False, '');
+  FLast := TDictionary<string, string>.Create;
+  inherited Create(False);
+end;
+
+destructor TMCPResourceWatcher.Destroy;
+begin
+  inherited; // waits for Execute
+  FLast.Free;
+  FWake.Free;
+end;
+
+procedure TMCPResourceWatcher.Stop;
+begin
+  Terminate;
+  FWake.SetEvent;
+end;
+
+procedure TMCPResourceWatcher.Execute;
+var
+  Interval: Cardinal;
+begin
+  NameThreadForDebugging('MCPForms resource watcher');
+  while not Terminated do
+  begin
+    Interval := FContext.FResourcePollInterval;
+    if Interval = 0 then
+      Interval := 1000
+    else if Interval < 100 then
+      Interval := 100;
+    FWake.WaitFor(Interval);
+    if Terminated then
+      Break;
+    if (FContext.FResourcePollInterval = 0) or not FContext.HasLiveSessions then
+    begin
+      FHaveList := False;
+      FLast.Clear;
+      Continue;
+    end;
+    try
+      Poll;
+    except
+      // the main thread may be busy or closing: try again next time
+    end;
+  end;
+end;
+
+procedure TMCPResourceWatcher.Poll;
+var
+  Uris: TArray<string>;
+  ListKey: string;
+  Contents: TArray<string>;
+  Ctx: TModelContext;
+  I: Integer;
+  Old: string;
+  Keep: TList<string>;
+  K: string;
+begin
+  Ctx := FContext;
+  Uris := Ctx.SubscribedUris;
+  SetLength(Contents, Length(Uris));
+  Ctx.RunOnMainThread(
+    function: string
+    var
+      R: TMCPResourceInfo;
+      J: Integer;
+      Mime: string;
+    begin
+      ListKey := '';
+      for R in Ctx.ListResources do
+        ListKey := ListKey + R.Uri + #9 + R.Title + #10;
+      for J := 0 to High(Uris) do
+        try
+          Contents[J] := Ctx.ReadResource(Uris[J], Mime);
+        except
+          Contents[J] := #0'missing';
+        end;
+      Result := '';
+    end);
+  if Terminated then
+    Exit;
+
+  if FHaveList and (ListKey <> FLastList) then
+    Ctx.ResourcesChanged;
+  FLastList := ListKey;
+  FHaveList := True;
+
+  for I := 0 to High(Uris) do
+  begin
+    if FLast.TryGetValue(Uris[I], Old) and (Old <> Contents[I]) then
+      Ctx.ResourceUpdated(Uris[I]);
+    FLast.AddOrSetValue(Uris[I], Contents[I]);
+  end;
+  // forget what nobody subscribes to any more
+  Keep := TList<string>.Create;
+  try
+    Keep.AddRange(Uris);
+    for K in FLast.Keys.ToArray do
+      if not Keep.Contains(K) then
+        FLast.Remove(K);
+  finally
+    Keep.Free;
+  end;
+end;
+
 { TMCPSchema }
 
 constructor TMCPSchema.Create;
@@ -513,6 +752,10 @@ begin
   FLock := TCriticalSection.Create;
   FTools := TList<IMCPTool>.Create;
   FPending := TList<IMCPAwaitable>.Create;
+  FToolChangeListeners := TDictionary<Integer, TProc>.Create;
+  FProviders := TList<TPair<Integer, IMCPResourceProvider>>.Create;
+  FSessions := TObjectList<TObject>.Create(True);
+  FResourcePollInterval := 1000;
   FServerName := ChangeFileExt(ExtractFileName(ParamStr(0)), '');
   FServerVersion := MCPFormsVersion;
   FMainThreadTimeout := 5 * 60 * 1000;
@@ -520,8 +763,17 @@ end;
 
 destructor TModelContext.Destroy;
 begin
+  if FWatcher <> nil then
+  begin
+    TMCPResourceWatcher(FWatcher).Stop;
+    CancelPending('The application is closing.'); // releases a pending poll
+    FreeAndNil(FWatcher);
+  end;
+  FSessions.Free;
+  FProviders.Free;
   CancelPending('The application is closing.');
   FPending.Free;
+  FToolChangeListeners.Free;
   FTools.Free;
   FLock.Free;
   inherited;
@@ -538,9 +790,47 @@ begin
 end;
 
 procedure TModelContext.ToolsChanged;
+var
+  Listeners: TArray<TProc>;
+  L: TProc;
 begin
   if Assigned(FOnToolChange) then
     FOnToolChange();
+  FLock.Enter;
+  try
+    Listeners := FToolChangeListeners.Values.ToArray;
+  finally
+    FLock.Leave;
+  end;
+  for L in Listeners do
+    try
+      L();
+    except
+      // a listener must never break a registration
+    end;
+  Notify('notifications/tools/list_changed');
+end;
+
+function TModelContext.AddToolChangeListener(const Listener: TProc): Integer;
+begin
+  FLock.Enter;
+  try
+    Inc(FNextListenerId);
+    Result := FNextListenerId;
+    FToolChangeListeners.Add(Result, Listener);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TModelContext.RemoveToolChangeListener(Id: Integer);
+begin
+  FLock.Enter;
+  try
+    FToolChangeListeners.Remove(Id);
+  finally
+    FLock.Leave;
+  end;
 end;
 
 function TModelContext.FindTool(const Name: string): IMCPTool;
@@ -757,6 +1047,336 @@ begin
   Result := Output;
 end;
 
+{ Sessions and notifications }
+
+function TModelContext.FindState(const Session: IMCPSession): TObject;
+var
+  O: TObject;
+begin
+  // FLock held by the caller
+  for O in FSessions do
+    if TMCPSessionState(O).Session = Session then
+      Exit(O);
+  Result := nil;
+end;
+
+procedure TModelContext.AttachSession(const Session: IMCPSession);
+begin
+  if Session = nil then
+    Exit;
+  FLock.Enter;
+  try
+    if FindState(Session) = nil then
+      FSessions.Add(TMCPSessionState.Create(Session));
+    if FWatcher = nil then
+      FWatcher := TMCPResourceWatcher.Create(Self);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TModelContext.DetachSession(const Session: IMCPSession);
+var
+  S: TObject;
+begin
+  FLock.Enter;
+  try
+    S := FindState(Session);
+    if S <> nil then
+      FSessions.Remove(S);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TModelContext.HasLiveSessions: Boolean;
+var
+  O: TObject;
+begin
+  Result := False;
+  FLock.Enter;
+  try
+    for O in FSessions do
+      if TMCPSessionState(O).Initialized then
+        Exit(True);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TModelContext.SubscribedUris: TArray<string>;
+var
+  O: TObject;
+  All: TStringList;
+begin
+  All := TStringList.Create;
+  try
+    All.Sorted := True;
+    All.Duplicates := dupIgnore;
+    All.CaseSensitive := True;
+    FLock.Enter;
+    try
+      for O in FSessions do
+        All.AddStrings(TMCPSessionState(O).Subscriptions);
+    finally
+      FLock.Leave;
+    end;
+    Result := All.ToStringArray;
+  finally
+    All.Free;
+  end;
+end;
+
+procedure TModelContext.SendToSessions(const MessageJSON: string; const OnlyUri: string);
+var
+  Targets: TList<IMCPSession>;
+  Dead: TList<IMCPSession>;
+  O: TObject;
+  St: TMCPSessionState;
+  S: IMCPSession;
+begin
+  Targets := TList<IMCPSession>.Create;
+  Dead := TList<IMCPSession>.Create;
+  try
+    FLock.Enter;
+    try
+      for O in FSessions do
+      begin
+        St := TMCPSessionState(O);
+        if not St.Initialized then
+          Continue;
+        if (OnlyUri <> '') and (St.Subscriptions.IndexOf(OnlyUri) < 0) then
+          Continue;
+        Targets.Add(St.Session);
+      end;
+    finally
+      FLock.Leave;
+    end;
+    // outside the lock: a transport may block for a while
+    for S in Targets do
+      try
+        if S.Alive then
+          S.Send(MessageJSON)
+        else
+          Dead.Add(S);
+      except
+        Dead.Add(S);
+      end;
+    for S in Dead do
+      DetachSession(S);
+  finally
+    Dead.Free;
+    Targets.Free;
+  end;
+end;
+
+procedure TModelContext.Notify(const Method: string; Params: TJSONObject);
+var
+  Msg: TJSONObject;
+  Text: string;
+begin
+  Msg := TJSONObject.Create;
+  try
+    Msg.AddPair('jsonrpc', '2.0');
+    Msg.AddPair('method', Method);
+    if Params <> nil then
+    begin
+      Msg.AddPair('params', Params);
+      Params := nil;
+    end;
+    Text := Msg.ToJSON;
+  finally
+    Msg.Free;
+    Params.Free;
+  end;
+  SendToSessions(Text);
+end;
+
+procedure TModelContext.ResourcesChanged;
+begin
+  Log('resources changed');
+  Notify('notifications/resources/list_changed');
+end;
+
+procedure TModelContext.ResourceUpdated(const Uri: string);
+var
+  Msg, Params: TJSONObject;
+  Text: string;
+begin
+  Log('resource updated ' + Uri);
+  Msg := TJSONObject.Create;
+  try
+    Msg.AddPair('jsonrpc', '2.0');
+    Msg.AddPair('method', 'notifications/resources/updated');
+    Params := TJSONObject.Create;
+    Params.AddPair('uri', Uri);
+    Msg.AddPair('params', Params);
+    Text := Msg.ToJSON;
+  finally
+    Msg.Free;
+  end;
+  SendToSessions(Text, Uri);
+end;
+
+{ Resources }
+
+function TModelContext.RegisterResourceProvider(const Provider: IMCPResourceProvider): Integer;
+begin
+  FLock.Enter;
+  try
+    Inc(FNextProviderId);
+    Result := FNextProviderId;
+    FProviders.Add(TPair<Integer, IMCPResourceProvider>.Create(Result, Provider));
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TModelContext.UnregisterResourceProvider(Id: Integer);
+var
+  I: Integer;
+begin
+  FLock.Enter;
+  try
+    for I := FProviders.Count - 1 downto 0 do
+      if FProviders[I].Key = Id then
+        FProviders.Delete(I);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TModelContext.ListResources: TArray<TMCPResourceInfo>;
+var
+  Providers: TArray<TPair<Integer, IMCPResourceProvider>>;
+  List: TArray<TMCPResourceInfo>;
+begin
+  FLock.Enter;
+  try
+    Providers := FProviders.ToArray;
+  finally
+    FLock.Leave;
+  end;
+  List := nil;
+  RunOnMainThread(
+    function: string
+    var
+      P: TPair<Integer, IMCPResourceProvider>;
+    begin
+      for P in Providers do
+        List := List + P.Value.ListResources;
+      Result := '';
+    end);
+  Result := List;
+end;
+
+function TModelContext.ReadResource(const Uri: string; out MimeType: string): string;
+var
+  Providers: TArray<TPair<Integer, IMCPResourceProvider>>;
+  Found: Boolean;
+  Mime, Text: string;
+begin
+  FLock.Enter;
+  try
+    Providers := FProviders.ToArray;
+  finally
+    FLock.Leave;
+  end;
+  Found := False;
+  RunOnMainThread(
+    function: string
+    var
+      P: TPair<Integer, IMCPResourceProvider>;
+    begin
+      for P in Providers do
+        if P.Value.ReadResource(Uri, Mime, Text) then
+        begin
+          Found := True;
+          Break;
+        end;
+      Result := '';
+    end);
+  if not Found then
+    raise EMCPProtocolError.Create(-32002, 'Resource not found: ' + Uri);
+  MimeType := Mime;
+  Result := Text;
+end;
+
+function TModelContext.HandleResourcesList: TJSONObject;
+var
+  Arr: TJSONArray;
+  R: TMCPResourceInfo;
+  O: TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Result.AddPair('resources', Arr);
+  for R in ListResources do
+  begin
+    O := TJSONObject.Create;
+    O.AddPair('uri', R.Uri);
+    O.AddPair('name', R.Name);
+    if R.Title <> '' then
+      O.AddPair('title', R.Title);
+    if R.Description <> '' then
+      O.AddPair('description', R.Description);
+    if R.MimeType <> '' then
+      O.AddPair('mimeType', R.MimeType);
+    Arr.Add(O);
+  end;
+end;
+
+function TModelContext.HandleResourcesRead(Params: TJSONObject): TJSONObject;
+var
+  Uri, Mime, Text: string;
+  Arr: TJSONArray;
+  O: TJSONObject;
+begin
+  if (Params = nil) or not Params.TryGetValue<string>('uri', Uri) then
+    raise EMCPProtocolError.Create(-32602, 'Missing "uri"');
+  Text := ReadResource(Uri, Mime);
+  Result := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Result.AddPair('contents', Arr);
+  O := TJSONObject.Create;
+  O.AddPair('uri', Uri);
+  if Mime <> '' then
+    O.AddPair('mimeType', Mime);
+  O.AddPair('text', Text);
+  Arr.Add(O);
+end;
+
+function TModelContext.HandleSubscribe(Params: TJSONObject; const Session: IMCPSession;
+  Subscribe: Boolean): TJSONObject;
+var
+  Uri: string;
+  St: TMCPSessionState;
+  I: Integer;
+begin
+  if (Params = nil) or not Params.TryGetValue<string>('uri', Uri) then
+    raise EMCPProtocolError.Create(-32602, 'Missing "uri"');
+  if Session = nil then
+    raise EMCPProtocolError.Create(-32601,
+      'This transport cannot send notifications: subscriptions are not available.');
+  FLock.Enter;
+  try
+    St := TMCPSessionState(FindState(Session));
+    if St <> nil then
+      if Subscribe then
+        St.Subscriptions.Add(Uri)
+      else
+      begin
+        I := St.Subscriptions.IndexOf(Uri);
+        if I >= 0 then
+          St.Subscriptions.Delete(I);
+      end;
+  finally
+    FLock.Leave;
+  end;
+  Log(IfThen(Subscribe, 'subscribe ', 'unsubscribe ') + Uri);
+  Result := TJSONObject.Create;
+end;
+
 function TModelContext.ErrorResponse(Id: TJSONValue; Code: Integer; const Msg: string): string;
 var
   Resp, Err: TJSONObject;
@@ -778,10 +1398,10 @@ begin
   end;
 end;
 
-function TModelContext.HandleInitialize(Params: TJSONObject): TJSONObject;
+function TModelContext.HandleInitialize(Params: TJSONObject; WithSession: Boolean): TJSONObject;
 var
   Requested, Version, V: string;
-  Caps, ToolsCap, Info: TJSONObject;
+  Caps, ToolsCap, ResCap, Info: TJSONObject;
 begin
   Version := MCPProtocolVersions[0];
   if (Params <> nil) and Params.TryGetValue<string>('protocolVersion', Requested) then
@@ -793,8 +1413,13 @@ begin
   Result.AddPair('protocolVersion', Version);
   Caps := TJSONObject.Create;
   ToolsCap := TJSONObject.Create;
-  ToolsCap.AddPair('listChanged', TJSONBool.Create(False));
+  // Notifications need a channel from the server to the client.
+  ToolsCap.AddPair('listChanged', TJSONBool.Create(WithSession));
   Caps.AddPair('tools', ToolsCap);
+  ResCap := TJSONObject.Create;
+  ResCap.AddPair('subscribe', TJSONBool.Create(WithSession));
+  ResCap.AddPair('listChanged', TJSONBool.Create(WithSession));
+  Caps.AddPair('resources', ResCap);
   Result.AddPair('capabilities', Caps);
   Info := TJSONObject.Create;
   Info.AddPair('name', FServerName);
@@ -909,7 +1534,8 @@ begin
   Result.AddPair('isError', TJSONBool.Create(IsError));
 end;
 
-function TModelContext.HandleMessage(const RequestJSON: string): string;
+function TModelContext.HandleMessage(const RequestJSON: string;
+  const Session: IMCPSession): string;
 var
   V, Id, MethodValue, ParamsValue: TJSONValue;
   Req, Resp, Params, ResultObj: TJSONObject;
@@ -923,6 +1549,8 @@ begin
     Exit(ErrorResponse(nil, -32700, 'Parse error: expected one JSON-RPC object'));
   end;
   Req := TJSONObject(V);
+  if Session <> nil then
+    AttachSession(Session);
   try
     Id := Req.GetValue('id');
     MethodValue := Req.GetValue('method');
@@ -942,13 +1570,38 @@ begin
 
     try
       if Method = 'initialize' then
-        ResultObj := HandleInitialize(Params)
+      begin
+        ResultObj := HandleInitialize(Params, Session <> nil);
+        if Session <> nil then
+        begin
+          FLock.Enter;
+          try
+            if FindState(Session) <> nil then
+              TMCPSessionState(FindState(Session)).Initialized := True;
+          finally
+            FLock.Leave;
+          end;
+        end;
+      end
       else if Method = 'ping' then
         ResultObj := TJSONObject.Create
       else if Method = 'tools/list' then
         ResultObj := HandleToolsList
       else if Method = 'tools/call' then
         ResultObj := HandleToolsCall(Params)
+      else if Method = 'resources/list' then
+        ResultObj := HandleResourcesList
+      else if Method = 'resources/read' then
+        ResultObj := HandleResourcesRead(Params)
+      else if Method = 'resources/templates/list' then
+      begin
+        ResultObj := TJSONObject.Create;
+        ResultObj.AddPair('resourceTemplates', TJSONArray.Create);
+      end
+      else if Method = 'resources/subscribe' then
+        ResultObj := HandleSubscribe(Params, Session, True)
+      else if Method = 'resources/unsubscribe' then
+        ResultObj := HandleSubscribe(Params, Session, False)
       else
         Exit(ErrorResponse(Id, -32601, 'Method not found: ' + Method));
 

@@ -50,6 +50,10 @@ type
     procedure SetConsequentialHint(Value: Boolean);
     procedure SetUntrustedContentHint(Value: Boolean);
     function ExecuteFromAgent(const Args: TJSONObject): string;
+    /// Main thread: checks the form, fills it, highlights it, and clicks the
+    /// submit control with AutoSubmit. A is set as soon as the call is pending,
+    /// so a caller can settle it if a later step raises.
+    procedure Activate(const Args: TJSONObject; var A: IMCPAwaitable);
     procedure ClearPending;
   protected
     procedure Loaded; override;
@@ -77,6 +81,8 @@ type
     procedure Reject(const Msg: string);
     /// True while an agent call is waiting for this form to be submitted.
     function AgentInvoked: Boolean;
+    /// The name the tool is registered under, '' when it is not registered.
+    property RegisteredName: string read FRegisteredName;
   published
     property Active: Boolean read FActive write SetActive default True;
     /// toolname: 1-64 letters, digits, _ - .  Prefer a precise verb: "create-order".
@@ -130,6 +136,20 @@ function MCPMatchItem(const Param: string; Items: TStrings; V: TJSONValue): Inte
 procedure MCPAddEnum(Schema: TJSONObject; Items: TStrings);
 /// Adds "examples" with up to 20 items.
 procedure MCPAddExamples(Schema: TJSONObject; Items: TStrings);
+
+{ Lists and grids: read by screen snapshots, never written by a form tool. }
+
+/// A list: an array of strings, or of {"text", "checked"} objects.
+function MCPListSchema(Checkable: Boolean = False): TJSONObject;
+/// A table: an array of objects, one property per column (Keys), titled with
+/// the column captions (Titles).
+function MCPTableSchema(const Keys, Titles: TArray<string>): TJSONObject;
+/// Unique, non-empty property names from column captions.
+function MCPColumnKeys(const Captions: TArray<string>): TArray<string>;
+/// A list item: the text, or {"text", "checked"}.
+function MCPListItem(const Text: string; Checkable, Checked: Boolean): TJSONValue;
+/// The error SetValue raises on a list or a grid.
+function MCPReadOnlyDataError(const Param: string): EMCPToolError;
 
 implementation
 
@@ -327,6 +347,94 @@ begin
   Schema.AddPair('examples', A);
 end;
 
+function MCPListSchema(Checkable: Boolean): TJSONObject;
+var
+  Item, Props: TJSONObject;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('type', 'array');
+  Item := TJSONObject.Create;
+  if Checkable then
+  begin
+    Item.AddPair('type', 'object');
+    Props := TJSONObject.Create;
+    Props.AddPair('text', TJSONObject.Create(TJSONPair.Create('type', 'string')));
+    Props.AddPair('checked', TJSONObject.Create(TJSONPair.Create('type', 'boolean')));
+    Item.AddPair('properties', Props);
+  end
+  else
+    Item.AddPair('type', 'string');
+  Result.AddPair('items', Item);
+end;
+
+function MCPTableSchema(const Keys, Titles: TArray<string>): TJSONObject;
+var
+  Item, Props, Col: TJSONObject;
+  I: Integer;
+begin
+  Result := TJSONObject.Create;
+  Result.AddPair('type', 'array');
+  Item := TJSONObject.Create;
+  Item.AddPair('type', 'object');
+  Props := TJSONObject.Create;
+  for I := 0 to High(Keys) do
+  begin
+    Col := TJSONObject.Create;
+    Col.AddPair('type', 'string');
+    if (I <= High(Titles)) and (Titles[I] <> '') and (Titles[I] <> Keys[I]) then
+      Col.AddPair('title', Titles[I]);
+    Props.AddPair(Keys[I], Col);
+  end;
+  Item.AddPair('properties', Props);
+  Result.AddPair('items', Item);
+end;
+
+function MCPColumnKeys(const Captions: TArray<string>): TArray<string>;
+var
+  I, N: Integer;
+  K, Base: string;
+  Used: TList<string>;
+begin
+  SetLength(Result, Length(Captions));
+  Used := TList<string>.Create;
+  try
+    for I := 0 to High(Captions) do
+    begin
+      Base := MCPCleanCaption(Captions[I]);
+      if Base = '' then
+        Base := 'column' + IntToStr(I + 1);
+      K := Base;
+      N := 2;
+      while Used.Contains(K) do
+      begin
+        K := Base + '_' + IntToStr(N);
+        Inc(N);
+      end;
+      Used.Add(K);
+      Result[I] := K;
+    end;
+  finally
+    Used.Free;
+  end;
+end;
+
+function MCPListItem(const Text: string; Checkable, Checked: Boolean): TJSONValue;
+var
+  O: TJSONObject;
+begin
+  if not Checkable then
+    Exit(TJSONString.Create(Text));
+  O := TJSONObject.Create;
+  O.AddPair('text', Text);
+  O.AddPair('checked', TJSONBool.Create(Checked));
+  Result := O;
+end;
+
+function MCPReadOnlyDataError(const Param: string): EMCPToolError;
+begin
+  Result := EMCPToolError.CreateFmt('Parameter "%s" is a list that can only be read.', [Param]);
+end;
+
 { TMCPCustomFormTool }
 
 constructor TMCPCustomFormTool.Create(AOwner: TComponent);
@@ -447,6 +555,28 @@ begin
   FRegisteredName := FToolName;
 end;
 
+procedure TMCPCustomFormTool.Activate(const Args: TJSONObject; var A: IMCPAwaitable);
+begin
+  if not GAliveTools.Contains(Self) then
+    raise EMCPToolError.Create('The form was closed.');
+  if not IsUsable then
+    raise EMCPToolError.CreateFmt('The form behind "%s" is not open right now. ' +
+      'Ask the user to open it, then try again.', [FToolName]);
+  if FPending <> nil then
+  begin
+    FPending.Reject('Superseded by a newer call.');
+    FPending := nil;
+  end;
+  ApplyArguments(Args);
+  A := ModelContext.NewAwaitable;
+  FPending := A;
+  ShowActive(True);
+  if Assigned(FOnToolActivated) then
+    FOnToolActivated(Self);
+  if FAutoSubmit then
+    ClickSubmit;
+end;
+
 function TMCPCustomFormTool.ExecuteFromAgent(const Args: TJSONObject): string;
 var
   Ctx: TModelContext;
@@ -461,25 +591,8 @@ begin
       function: string
       begin
         Result := '';
-        if not GAliveTools.Contains(Self) then
-          raise EMCPToolError.Create('The form was closed.');
-        if not IsUsable then
-          raise EMCPToolError.CreateFmt('The form behind "%s" is not open right now. ' +
-            'Ask the user to open it, then try again.', [FToolName]);
-        if FPending <> nil then
-        begin
-          FPending.Reject('Superseded by a newer call.');
-          FPending := nil;
-        end;
-        ApplyArguments(Args);
-        A := Ctx.NewAwaitable;
-        FPending := A;
-        ShowActive(True);
-        if Assigned(FOnToolActivated) then
-          FOnToolActivated(Self);
         Timeout := FSubmitTimeout;
-        if FAutoSubmit then
-          ClickSubmit;
+        Activate(Args, A);
       end);
   except
     // e.g. the automatic submit raised: settle and forget the pending call

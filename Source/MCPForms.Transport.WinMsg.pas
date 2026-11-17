@@ -6,6 +6,8 @@ unit MCPForms.Transport.WinMsg;
   receives JSON-RPC requests (see MCPForms.WinMsg for the wire format).
   Each request runs on its own worker thread, so tools that wait for the user
   never block the main thread; the response goes back as WM_COPYDATA.
+  Each client reply window is a session: it gets the server's notifications
+  (WM_COPYDATA with dwData = 0) and can subscribe to resources.
 
   No network port is opened. Standard MCP clients reach it through
   mcp-winmsg-bridge.exe (stdio <-> WM_COPYDATA).
@@ -18,6 +20,7 @@ interface
 
 uses
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Classes, System.SyncObjs,
+  System.Generics.Collections,
   MCPForms.Core, MCPForms.WinMsg;
 
 type
@@ -28,6 +31,8 @@ type
     FName: string;
     FWorkers: IInterface; // shared counter, outlives the server if needed
     FStopping: Boolean;
+    FSessions: TDictionary<HWND, IMCPSession>; // main thread
+    function SessionFor(Client: HWND): IMCPSession;
     function HandleCopyData(Sender: HWND; Data: PCopyDataStruct): Boolean;
   public
     constructor Create(AContext: TModelContext = nil);
@@ -44,6 +49,18 @@ type
 implementation
 
 type
+  /// One client reply window.
+  TWinMsgSession = class(TInterfacedObject, IMCPSession)
+  private
+    FClient: HWND;
+    FServer: HWND;
+    FClosed: Boolean;
+  public
+    constructor Create(AClient, AServer: HWND);
+    procedure Send(const MessageJSON: string);
+    function Alive: Boolean;
+  end;
+
   IWorkerCount = interface
     ['{0E2D8C34-7B1A-4F5E-A9C6-3D4B5E6F7081}']
     procedure Enter;
@@ -93,6 +110,26 @@ begin
   Result := DefWindowProc(Wnd, Msg, wParam, lParam);
 end;
 
+{ TWinMsgSession }
+
+constructor TWinMsgSession.Create(AClient, AServer: HWND);
+begin
+  inherited Create;
+  FClient := AClient;
+  FServer := AServer;
+end;
+
+procedure TWinMsgSession.Send(const MessageJSON: string);
+begin
+  if not FClosed then
+    MCPSendCopyData(FClient, FServer, MCPWinMsgNotifyId, MessageJSON, 5000);
+end;
+
+function TWinMsgSession.Alive: Boolean;
+begin
+  Result := not FClosed and IsWindow(FClient);
+end;
+
 { TMCPWinMsgServer }
 
 constructor TMCPWinMsgServer.Create(AContext: TModelContext);
@@ -102,12 +139,31 @@ begin
   if FContext = nil then
     FContext := ModelContext;
   FWorkers := TWorkerCount.Create;
+  FSessions := TDictionary<HWND, IMCPSession>.Create;
 end;
 
 destructor TMCPWinMsgServer.Destroy;
 begin
   Stop;
+  FSessions.Free;
   inherited;
+end;
+
+function TMCPWinMsgServer.SessionFor(Client: HWND): IMCPSession;
+var
+  Pair: TPair<HWND, IMCPSession>;
+begin
+  if FSessions.TryGetValue(Client, Result) and Result.Alive then
+    Exit;
+  // forget the windows that are gone
+  for Pair in FSessions.ToArray do
+    if not Pair.Value.Alive then
+    begin
+      FContext.DetachSession(Pair.Value);
+      FSessions.Remove(Pair.Key);
+    end;
+  Result := TWinMsgSession.Create(Client, FWnd);
+  FSessions.AddOrSetValue(Client, Result);
 end;
 
 function TMCPWinMsgServer.Active: Boolean;
@@ -130,10 +186,17 @@ end;
 procedure TMCPWinMsgServer.Stop;
 var
   Deadline: UInt64;
+  S: IMCPSession;
 begin
   if FWnd = 0 then
     Exit;
   FStopping := True;
+  for S in FSessions.Values do
+  begin
+    FContext.DetachSession(S);
+    TWinMsgSession(S).FClosed := True;
+  end;
+  FSessions.Clear;
   SetWindowLongPtr(FWnd, GWLP_USERDATA, 0);
   DestroyWindow(FWnd);
   FWnd := 0;
@@ -154,6 +217,7 @@ var
   ReplyFrom: HWND;
   Ctx: TModelContext;
   Workers: IWorkerCount;
+  Session: IMCPSession;
 begin
   Result := False;
   if FStopping or (Data = nil) or (Data.dwData = 0) or (Data.cbData = 0) or
@@ -164,6 +228,7 @@ begin
   ReplyFrom := FWnd;
   Ctx := FContext;
   Workers := FWorkers as IWorkerCount;
+  Session := SessionFor(Sender);
   Workers.Enter;
   // The worker never touches Self: the server may be freed while it runs.
   TThread.CreateAnonymousThread(
@@ -173,7 +238,7 @@ begin
     begin
       try
         try
-          Reply := Ctx.HandleMessage(Request);
+          Reply := Ctx.HandleMessage(Request, Session);
         except
           on E: Exception do
             Reply := '';

@@ -15,6 +15,11 @@ unit MCPForms.FMX;
     TDateEdit                              -> "YYYY-MM-DD"
     TTimeEdit                              -> "HH:MM" or "HH:MM:SS"
 
+  Lists and grids are read by screen snapshots (MCPForms.Screen), not written:
+    TListBox                               -> array of strings / of (text, checked)
+    TStringGrid                            -> table (headers from the columns)
+    TListView                              -> array of texts, or (text, detail)
+
   Parameter description, in order: TMCPParam.Description, the control's Hint,
   TextPrompt of an edit, the nearest TLabel on the left or above.
 
@@ -35,6 +40,18 @@ type
     function Schema(C: TControl): TJSONObject; virtual; abstract;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); virtual; abstract;
     function OwnCaption(C: TControl): string; virtual;
+    /// Current value as JSON (string, number, boolean, or TJSONNull for "no
+    /// value"), or nil when the adapter cannot read it. Used by the screen
+    /// snapshots of MCPForms.Screen; optional for third-party adapters.
+    function GetValue(C: TControl): TJSONValue; virtual;
+    /// A list or a grid: read by screen snapshots (GetValue returns an
+    /// array, at most MCPScreenMaxRows rows), never a form tool parameter.
+    function IsDataView(C: TControl): Boolean; virtual;
+    /// A list or a grid: the selected row (TJSONNumber, 0-based), the selected
+    /// rows (TJSONArray), TJSONNull, or nil when unknown.
+    function GetSelection(C: TControl): TJSONValue; virtual;
+    /// A list or a grid: how many rows it has. -1 otherwise.
+    function RowCount(C: TControl): Integer; virtual;
   end;
 
   TMCPParam = class(TCollectionItem)
@@ -114,7 +131,10 @@ implementation
 uses
   System.Math,
   FMX.StdCtrls, FMX.Edit, FMX.EditBox, FMX.ComboEdit, FMX.ListBox, FMX.Memo,
-  FMX.DateTimeCtrls, FMX.DialogService.Sync, FMX.Text, FMX.Graphics;
+  FMX.DateTimeCtrls, FMX.DialogService.Sync, FMX.Text, FMX.Graphics, FMX.TabControl,
+  FMX.Grid, FMX.ListView, FMX.ListView.Appearances,
+  System.Messaging,
+  MCPForms.Screen;
 
 type
   TControlAccess = class(TControl);
@@ -171,6 +191,34 @@ begin
   Result := '';
 end;
 
+function TMCPControlAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  Result := nil;
+end;
+
+function TMCPControlAdapter.IsDataView(C: TControl): Boolean;
+begin
+  Result := False;
+end;
+
+function TMCPControlAdapter.GetSelection(C: TControl): TJSONValue;
+begin
+  Result := nil;
+end;
+
+function TMCPControlAdapter.RowCount(C: TControl): Integer;
+begin
+  Result := -1;
+end;
+
+function NumberValue(V: Double; AsInteger: Boolean): TJSONValue;
+begin
+  if AsInteger then
+    Result := TJSONNumber.Create(Int64(Round(V)))
+  else
+    Result := TJSONNumber.Create(V);
+end;
+
 { Built-in adapters }
 
 type
@@ -178,36 +226,42 @@ type
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TComboEditAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TEditBoxAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TMemoAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TComboBoxAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TCheckAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
     function OwnCaption(C: TControl): string; override;
   end;
 
@@ -215,18 +269,21 @@ type
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TDateEditAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
   TTimeEditAdapter = class(TMCPControlAdapter)
     function Supports(C: TControl): Boolean; override;
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+    function GetValue(C: TControl): TJSONValue; override;
   end;
 
 { TEditAdapter }
@@ -248,6 +305,11 @@ begin
   TCustomEdit(C).Text := MCPArgString(Param, Value);
 end;
 
+function TEditAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  Result := TJSONString.Create(TCustomEdit(C).Text);
+end;
+
 { TComboEditAdapter }
 
 function TComboEditAdapter.Supports(C: TControl): Boolean;
@@ -264,6 +326,11 @@ end;
 procedure TComboEditAdapter.SetValue(C: TControl; const Param: string; Value: TJSONValue);
 begin
   TCustomComboEdit(C).Text := MCPArgString(Param, Value);
+end;
+
+function TComboEditAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  Result := TJSONString.Create(TCustomComboEdit(C).Text);
 end;
 
 { TEditBoxAdapter }
@@ -299,6 +366,14 @@ begin
   B.Value := V;
 end;
 
+function TEditBoxAdapter.GetValue(C: TControl): TJSONValue;
+var
+  B: TCustomEditBox;
+begin
+  B := TCustomEditBox(C);
+  Result := NumberValue(B.Value, B.ValueType = TNumValueType.Integer);
+end;
+
 { TMemoAdapter }
 
 function TMemoAdapter.Supports(C: TControl): Boolean;
@@ -316,6 +391,11 @@ begin
   if TCustomMemo(C).ReadOnly then
     raise EMCPToolError.CreateFmt('Parameter "%s" is read-only.', [Param]);
   TCustomMemo(C).Text := MCPArgString(Param, Value);
+end;
+
+function TMemoAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  Result := TJSONString.Create(TCustomMemo(C).Text);
 end;
 
 { TComboBoxAdapter }
@@ -359,6 +439,17 @@ begin
   end;
 end;
 
+function TComboBoxAdapter.GetValue(C: TControl): TJSONValue;
+var
+  Cb: TCustomComboBox;
+begin
+  Cb := TCustomComboBox(C);
+  if (Cb.ItemIndex >= 0) and (Cb.ItemIndex < Cb.Count) then
+    Result := TJSONString.Create(Cb.ListItems[Cb.ItemIndex].Text)
+  else
+    Result := TJSONNull.Create;
+end;
+
 { TCheckAdapter }
 
 function TCheckAdapter.Supports(C: TControl): Boolean;
@@ -387,6 +478,14 @@ begin
     Result := '';
 end;
 
+function TCheckAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  if C is TCheckBox then
+    Result := TJSONBool.Create(TCheckBox(C).IsChecked)
+  else
+    Result := TJSONBool.Create(TCustomSwitch(C).IsChecked);
+end;
+
 { TTrackAdapter }
 
 function TTrackAdapter.Supports(C: TControl): Boolean;
@@ -409,6 +508,11 @@ begin
   TCustomTrack(C).Value := V;
 end;
 
+function TTrackAdapter.GetValue(C: TControl): TJSONValue;
+begin
+  Result := NumberValue(TCustomTrack(C).Value, False);
+end;
+
 { TDateEditAdapter }
 
 function TDateEditAdapter.Supports(C: TControl): Boolean;
@@ -427,6 +531,17 @@ begin
   TCustomDateEdit(C).Date := MCPArgDate(Param, Value);
 end;
 
+function TDateEditAdapter.GetValue(C: TControl): TJSONValue;
+var
+  D: TCustomDateEdit;
+begin
+  D := TCustomDateEdit(C);
+  if D.IsEmpty or (D.ShowCheckBox and not D.IsChecked) then
+    Result := TJSONNull.Create
+  else
+    Result := TJSONString.Create(FormatDateTime('yyyy"-"mm"-"dd', D.Date));
+end;
+
 { TTimeEditAdapter }
 
 function TTimeEditAdapter.Supports(C: TControl): Boolean;
@@ -443,6 +558,260 @@ end;
 procedure TTimeEditAdapter.SetValue(C: TControl; const Param: string; Value: TJSONValue);
 begin
   TCustomTimeEdit(C).Time := MCPArgTime(Param, Value);
+end;
+
+function TTimeEditAdapter.GetValue(C: TControl): TJSONValue;
+var
+  T: TCustomTimeEdit;
+begin
+  T := TCustomTimeEdit(C);
+  if T.IsEmpty or (T.ShowCheckBox and not T.IsChecked) then
+    Result := TJSONNull.Create
+  else
+    Result := TJSONString.Create(FormatDateTime('hh":"nn":"ss', T.Time));
+end;
+
+{ Lists and grids }
+
+type
+  /// Base of the read-only adapters: lists and grids.
+  TDataViewAdapter = class(TMCPControlAdapter)
+  public
+    function IsDataView(C: TControl): Boolean; override;
+    procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
+  end;
+
+  TListBoxAdapter = class(TDataViewAdapter)
+    function Supports(C: TControl): Boolean; override;
+    function Schema(C: TControl): TJSONObject; override;
+    function GetValue(C: TControl): TJSONValue; override;
+    function GetSelection(C: TControl): TJSONValue; override;
+    function RowCount(C: TControl): Integer; override;
+  end;
+
+  TStringGridAdapter = class(TDataViewAdapter)
+  private
+    function VisibleCols(G: TStringGrid): TArray<Integer>;
+    function Keys(G: TStringGrid; out Titles: TArray<string>): TArray<string>;
+  public
+    function Supports(C: TControl): Boolean; override;
+    function Schema(C: TControl): TJSONObject; override;
+    function GetValue(C: TControl): TJSONValue; override;
+    function GetSelection(C: TControl): TJSONValue; override;
+    function RowCount(C: TControl): Integer; override;
+  end;
+
+  /// TListView: Text, and Detail when an item has one.
+  TListViewAdapter = class(TDataViewAdapter)
+  private
+    function HasDetail(L: TAppearanceListView): Boolean;
+  public
+    function Supports(C: TControl): Boolean; override;
+    function Schema(C: TControl): TJSONObject; override;
+    function GetValue(C: TControl): TJSONValue; override;
+    function GetSelection(C: TControl): TJSONValue; override;
+    function RowCount(C: TControl): Integer; override;
+  end;
+
+type
+  TCustomListBoxAccess = class(TCustomListBox);
+
+{ TDataViewAdapter }
+
+function TDataViewAdapter.IsDataView(C: TControl): Boolean;
+begin
+  Result := True;
+end;
+
+procedure TDataViewAdapter.SetValue(C: TControl; const Param: string; Value: TJSONValue);
+begin
+  raise MCPReadOnlyDataError(Param);
+end;
+
+{ TListBoxAdapter }
+
+function TListBoxAdapter.Supports(C: TControl): Boolean;
+begin
+  Result := C is TCustomListBox;
+end;
+
+function TListBoxAdapter.Schema(C: TControl): TJSONObject;
+begin
+  Result := MCPListSchema(TCustomListBoxAccess(C).ShowCheckboxes);
+end;
+
+function TListBoxAdapter.GetValue(C: TControl): TJSONValue;
+var
+  L: TCustomListBox;
+  A: TJSONArray;
+  I: Integer;
+begin
+  L := TCustomListBox(C);
+  A := TJSONArray.Create;
+  for I := 0 to Min(L.Count, MCPScreenMaxRows) - 1 do
+    A.AddElement(MCPListItem(L.ListItems[I].Text, TCustomListBoxAccess(L).ShowCheckboxes,
+      L.ListItems[I].IsChecked));
+  Result := A;
+end;
+
+function TListBoxAdapter.GetSelection(C: TControl): TJSONValue;
+var
+  L: TCustomListBox;
+  A: TJSONArray;
+  I: Integer;
+begin
+  L := TCustomListBox(C);
+  if TCustomListBoxAccess(L).MultiSelectStyle <> TMultiSelectStyle.None then
+  begin
+    A := TJSONArray.Create;
+    for I := 0 to L.Count - 1 do
+      if L.ListItems[I].IsSelected then
+        A.Add(I);
+    Result := A;
+  end
+  else if L.ItemIndex >= 0 then
+    Result := TJSONNumber.Create(L.ItemIndex)
+  else
+    Result := TJSONNull.Create;
+end;
+
+function TListBoxAdapter.RowCount(C: TControl): Integer;
+begin
+  Result := TCustomListBox(C).Count;
+end;
+
+{ TStringGridAdapter }
+
+function TStringGridAdapter.Supports(C: TControl): Boolean;
+begin
+  Result := C is TStringGrid;
+end;
+
+function TStringGridAdapter.VisibleCols(G: TStringGrid): TArray<Integer>;
+var
+  I: Integer;
+begin
+  Result := nil;
+  for I := 0 to G.ColumnCount - 1 do
+    if G.Columns[I].Visible then
+      Result := Result + [I];
+end;
+
+function TStringGridAdapter.Keys(G: TStringGrid; out Titles: TArray<string>): TArray<string>;
+var
+  Cols: TArray<Integer>;
+  I: Integer;
+begin
+  Cols := VisibleCols(G);
+  SetLength(Titles, Length(Cols));
+  for I := 0 to High(Cols) do
+    Titles[I] := MCPCleanCaption(G.Columns[Cols[I]].Header);
+  Result := MCPColumnKeys(Titles);
+end;
+
+function TStringGridAdapter.Schema(C: TControl): TJSONObject;
+var
+  Titles: TArray<string>;
+begin
+  Result := MCPTableSchema(Keys(TStringGrid(C), Titles), Titles);
+end;
+
+function TStringGridAdapter.GetValue(C: TControl): TJSONValue;
+var
+  G: TStringGrid;
+  A: TJSONArray;
+  Row: TJSONObject;
+  Cols: TArray<Integer>;
+  K, Titles: TArray<string>;
+  R, I: Integer;
+begin
+  G := TStringGrid(C);
+  Cols := VisibleCols(G);
+  K := Keys(G, Titles);
+  A := TJSONArray.Create;
+  for R := 0 to Min(G.RowCount, MCPScreenMaxRows) - 1 do
+  begin
+    Row := TJSONObject.Create;
+    for I := 0 to High(Cols) do
+      Row.AddPair(K[I], G.Cells[Cols[I], R]);
+    A.AddElement(Row);
+  end;
+  Result := A;
+end;
+
+function TStringGridAdapter.GetSelection(C: TControl): TJSONValue;
+begin
+  if TStringGrid(C).Selected >= 0 then
+    Result := TJSONNumber.Create(TStringGrid(C).Selected)
+  else
+    Result := TJSONNull.Create;
+end;
+
+function TStringGridAdapter.RowCount(C: TControl): Integer;
+begin
+  Result := TStringGrid(C).RowCount;
+end;
+
+{ TListViewAdapter }
+
+function TListViewAdapter.Supports(C: TControl): Boolean;
+begin
+  Result := C is TAppearanceListView;
+end;
+
+function TListViewAdapter.HasDetail(L: TAppearanceListView): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to Min(L.Items.Count, MCPScreenMaxRows) - 1 do
+    if L.Items[I].Detail <> '' then
+      Exit(True);
+  Result := False;
+end;
+
+function TListViewAdapter.Schema(C: TControl): TJSONObject;
+begin
+  if HasDetail(TAppearanceListView(C)) then
+    Result := MCPTableSchema(['text', 'detail'], ['Text', 'Detail'])
+  else
+    Result := MCPListSchema;
+end;
+
+function TListViewAdapter.GetValue(C: TControl): TJSONValue;
+var
+  L: TAppearanceListView;
+  A: TJSONArray;
+  Row: TJSONObject;
+  Detail: Boolean;
+  I: Integer;
+begin
+  L := TAppearanceListView(C);
+  Detail := HasDetail(L);
+  A := TJSONArray.Create;
+  for I := 0 to Min(L.Items.Count, MCPScreenMaxRows) - 1 do
+    if Detail then
+    begin
+      Row := TJSONObject.Create;
+      Row.AddPair('text', L.Items[I].Text);
+      Row.AddPair('detail', L.Items[I].Detail);
+      A.AddElement(Row);
+    end
+    else
+      A.Add(L.Items[I].Text);
+  Result := A;
+end;
+
+function TListViewAdapter.GetSelection(C: TControl): TJSONValue;
+begin
+  if TAppearanceListView(C).ItemIndex >= 0 then
+    Result := TJSONNumber.Create(TAppearanceListView(C).ItemIndex)
+  else
+    Result := TJSONNull.Create;
+end;
+
+function TListViewAdapter.RowCount(C: TControl): Integer;
+begin
+  Result := TAppearanceListView(C).Items.Count;
 end;
 
 { Parameter discovery }
@@ -554,6 +923,8 @@ begin
         if P.Adapter = nil then
           Continue;
         if (C is TCustomEdit) and TCustomEdit(C).ReadOnly then
+          Continue;
+        if P.Adapter.IsDataView(C) then
           Continue;
         P.Control := C;
         P.Name := MCPParamNameFromComponent(C.Name);
@@ -887,6 +1258,270 @@ begin
   TControlAccess(FSubmitControl).Click;
 end;
 
+{ Screen snapshot }
+
+type
+  TKnownParam = record
+    Name: string;
+    Description: string;
+    Required: Boolean;
+    Tool: string;
+  end;
+
+var
+  // The form activated last that is not ignored (FMX keeps no z-order list).
+  GLastForm: TCommonCustomForm;
+  GActivateSub: TMessageSubscriptionId;
+
+procedure CollectFormTools(Owner: TComponent; List: TList<TMCPFormTool>);
+var
+  I: Integer;
+  C: TComponent;
+begin
+  for I := 0 to Owner.ComponentCount - 1 do
+  begin
+    C := Owner.Components[I];
+    if C is TMCPFormTool then
+      List.Add(TMCPFormTool(C))
+    else if C is TFrame then
+      CollectFormTools(C, List);
+  end;
+end;
+
+/// Visible as far as the user is concerned; an inactive tab counts as visible
+/// (it is one click away). Tab is the caption of the innermost tab item,
+/// TabHidden whether a tab on the way is not the active one.
+function VisibleOnForm(C: TControl; out Tab: string; out TabHidden: Boolean): Boolean;
+var
+  X: TFmxObject;
+  Item: TTabItem;
+begin
+  Tab := '';
+  TabHidden := False;
+  X := C;
+  while X is TControl do
+  begin
+    if X is TTabItem then
+    begin
+      Item := TTabItem(X);
+      if not Item.Visible then
+        Exit(False);
+      if Tab = '' then
+        Tab := MCPCleanCaption(Item.Text);
+      if (Item.TabControl <> nil) and (Item.TabControl.ActiveTab <> Item) then
+        TabHidden := True;
+    end
+    else if not TControl(X).Visible then
+      Exit(False);
+    X := X.Parent;
+  end;
+  Result := True;
+end;
+
+/// C or one of its parents was excluded with MCPIgnoreScreenControl.
+function InIgnored(C: TControl): Boolean;
+var
+  X: TFmxObject;
+begin
+  X := C;
+  while X is TControl do
+  begin
+    if MCPIsIgnoredScreenControl(X) then
+      Exit(True);
+    X := X.Parent;
+  end;
+  Result := False;
+end;
+
+function ReadFmxScreen(Root: TComponent): TMCPScreen;
+var
+  Form: TCommonCustomForm;
+  Tools: TList<TMCPFormTool>;
+  Tool: TMCPFormTool;
+  Known: TDictionary<TControl, TKnownParam>;
+  KP: TKnownParam;
+  P: TParamInfo;
+  All: TList<TControl>;
+  Names: TList<string>;
+  C: TControl;
+  Adapter: TMCPControlAdapter;
+  F: TMCPScreenField;
+  Name, Tab, Caption: string;
+  TabHidden: Boolean;
+  Focused: TFmxObject;
+begin
+  if not (Root is TCommonCustomForm) then
+    Exit(nil);
+  Form := TCommonCustomForm(Root);
+  Result := TMCPScreen.Create;
+  Tools := TList<TMCPFormTool>.Create;
+  Known := TDictionary<TControl, TKnownParam>.Create;
+  All := TList<TControl>.Create;
+  Names := TList<string>.Create;
+  try
+   try
+    Result.Form := Form.Name;
+    Result.Title := MCPCleanCaption(Form.Caption);
+
+    // What the form tools of this form say about their controls wins: the same
+    // names, descriptions and required flags a client gets in tools/list.
+    CollectFormTools(Form, Tools);
+    for Tool in Tools do
+    begin
+      if Tool.RegisteredName <> '' then
+        Result.Tools := Result.Tools + [Tool.RegisteredName];
+      if Tool.EffectiveContainer = nil then
+        Continue;
+      try
+        for P in ResolveParams(Tool, Tool.EffectiveContainer) do
+          if not Known.ContainsKey(P.Control) then
+          begin
+            KP.Name := P.Name;
+            KP.Description := P.Description;
+            KP.Required := P.Required;
+            KP.Tool := Tool.RegisteredName;
+            Known.Add(P.Control, KP);
+          end;
+      except
+        // a misconfigured tool must not hide the screen
+      end;
+    end;
+
+    CollectControls(Form, All);
+    for C in All do
+    begin
+      if (C.Name = '') or (C is TLabel) or not VisibleOnForm(C, Tab, TabHidden) or
+         InIgnored(C) then
+        Continue;
+      if C is TCustomButton then
+      begin
+        Caption := MCPCleanCaption(TCustomButton(C).Text);
+        if (Caption = '') and (C.Hint <> '') then
+          Caption := Trim(C.Hint);
+        Result.AddButton(C.Name, Caption, C.AbsoluteEnabled);
+        Continue;
+      end;
+      Adapter := FindAdapter(C);
+      if Adapter = nil then
+        Continue;
+      if not Known.TryGetValue(C, KP) then
+      begin
+        KP.Name := MCPParamNameFromComponent(C.Name);
+        KP.Description := DescribeControl(C, Adapter, All);
+        KP.Required := False;
+        KP.Tool := '';
+      end;
+      Name := KP.Name;
+      if Names.Contains(Name) then
+        Name := C.Name;
+      Names.Add(Name);
+
+      F := Result.AddField(Name, Adapter.Schema(C));
+      F.Title := KP.Description;
+      F.Required := KP.Required;
+      F.Tool := KP.Tool;
+      F.Tab := Tab;
+      F.TabHidden := TabHidden;
+      F.Disabled := not C.AbsoluteEnabled;
+      F.ReadOnly := ((C is TCustomEdit) and TCustomEdit(C).ReadOnly) or
+        ((C is TCustomMemo) and TCustomMemo(C).ReadOnly);
+      F.Secret := (C is TCustomEdit) and TCustomEdit(C).Password;
+      if Adapter.IsDataView(C) then
+      begin
+        F.ReadOnly := True;
+        F.TotalRows := Adapter.RowCount(C);
+        try
+          F.Selection := Adapter.GetSelection(C);
+        except
+          F.Selection := nil;
+        end;
+      end;
+      if not F.Secret then
+        try
+          F.Value := Adapter.GetValue(C);
+        except
+          F.Value := nil; // an unreadable control is reported as unknown
+        end;
+    end;
+
+    if Form.Focused <> nil then
+    begin
+      Focused := Form.Focused.GetObject;
+      while Focused is TControl do
+      begin
+        if Known.TryGetValue(TControl(Focused), KP) then
+        begin
+          Result.Focused := KP.Name;
+          Break;
+        end;
+        if FindAdapter(TControl(Focused)) <> nil then
+        begin
+          Result.Focused := MCPParamNameFromComponent(Focused.Name);
+          Break;
+        end;
+        Focused := Focused.Parent;
+      end;
+    end;
+   except
+    FreeAndNil(Result);
+    raise;
+   end;
+  finally
+    Names.Free;
+    All.Free;
+    Known.Free;
+    Tools.Free;
+  end;
+end;
+
+function IsLiveForm(F: TCommonCustomForm): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to Screen.FormCount - 1 do
+    if Screen.Forms[I] = F then
+      Exit(True);
+  Result := False;
+end;
+
+function ActiveFmxForm: TComponent;
+var
+  F: TCommonCustomForm;
+  I: Integer;
+begin
+  F := Screen.ActiveForm;
+  if (F <> nil) and F.Visible and not MCPIsIgnoredScreen(F) then
+    Exit(F);
+  if (GLastForm <> nil) and IsLiveForm(GLastForm) and GLastForm.Visible then
+    Exit(GLastForm);
+  for I := 0 to Screen.FormCount - 1 do
+  begin
+    F := Screen.Forms[I];
+    if F.Visible and not MCPIsIgnoredScreen(F) then
+      Exit(F);
+  end;
+  Result := Application.MainForm;
+end;
+
+function ListFmxForms: TArray<TComponent>;
+var
+  I: Integer;
+begin
+  Result := nil;
+  for I := 0 to Screen.FormCount - 1 do
+    if Screen.Forms[I].Visible then
+      Result := Result + [Screen.Forms[I]];
+end;
+
+procedure FormActivated(const Sender: TObject; const M: TMessage);
+var
+  F: TCommonCustomForm;
+begin
+  F := TFormActivateMessage(M).Value;
+  if (F <> nil) and not MCPIsIgnoredScreen(F) then
+    GLastForm := F;
+end;
+
 { Default confirmation }
 
 function MCPFmxConfirm(const Tool: IMCPTool; const Args: TJSONObject): Boolean;
@@ -914,10 +1549,17 @@ initialization
   RegisterMCPControlAdapter(TTrackAdapter.Create);
   RegisterMCPControlAdapter(TDateEditAdapter.Create);
   RegisterMCPControlAdapter(TTimeEditAdapter.Create);
+  RegisterMCPControlAdapter(TListBoxAdapter.Create);
+  RegisterMCPControlAdapter(TStringGridAdapter.Create);
+  RegisterMCPControlAdapter(TListViewAdapter.Create);
   if not Assigned(ModelContext.ConfirmHandler) then
     ModelContext.ConfirmHandler := MCPFmxConfirm;
+  MCPRegisterScreenReader(ReadFmxScreen, ActiveFmxForm, ListFmxForms);
+  GActivateSub := TMessageManager.DefaultManager.SubscribeToMessage(
+    TFormActivateMessage, FormActivated);
 
 finalization
+  TMessageManager.DefaultManager.Unsubscribe(TFormActivateMessage, GActivateSub);
   FreeAndNil(GAdapters);
 
 end.
