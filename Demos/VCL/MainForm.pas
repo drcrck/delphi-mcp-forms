@@ -80,6 +80,15 @@ begin
   FOrderTool.OnSubmit := OrderSubmitted;
   FOrderTool.ToolDescription :=
     'Create a sales order. Fills the "New order" form; the user reviews it and clicks Save.';
+  FOrderTool.ToolTitle := 'New order';
+  // Listing the parameters marks the required ones (like the HTML required
+  // attribute); with a list, only the controls in it are parameters.
+  FOrderTool.Params.Add(edtCustomer, '', '', True);
+  FOrderTool.Params.Add(cbProduct, '', '', True);
+  FOrderTool.Params.Add(spnQuantity);
+  FOrderTool.Params.Add(dtpDelivery);
+  FOrderTool.Params.Add(chkGiftWrap);
+  FOrderTool.Params.Add(memNotes);
   FOrderTool.ToolName := 'create-order';
 
   RegisterImperativeTools;

@@ -9,6 +9,10 @@ unit MCPForms.FormTool;
       (the user's click, or an automatic one with AutoSubmit);
     - OnSubmit plays the role of SubmitEvent.respondWith(): its Response is
       what the agent receives; Reject() returns an error the agent can fix.
+  An in-app assistant that cannot wait for the submit (it runs on the main
+  thread) uses Fill instead: the same checks and the same filling, the form
+  brought forward and highlighted, and nothing pending - the user reviews the
+  values and submits them, or not.
 
   MCPForms.VCL and MCPForms.FMX implement the control-specific parts.
 
@@ -38,6 +42,7 @@ type
     FSubmitTimeout: Cardinal;
     FRegisteredName: string;
     FPending: IMCPAwaitable;
+    FAssistFilled: Boolean;
     FOnSubmit: TMCPSubmitEvent;
     FOnToolActivated: TNotifyEvent;
     FOnToolCancel: TNotifyEvent;
@@ -55,6 +60,8 @@ type
     /// so a caller can settle it if a later step raises.
     procedure Activate(const Args: TJSONObject; var A: IMCPAwaitable);
     procedure ClearPending;
+    /// Takes the highlight of a Fill away (the user submitted or cancelled).
+    procedure EndAssistFill;
   protected
     procedure Loaded; override;
     procedure UpdateRegistration;
@@ -63,12 +70,21 @@ type
     { Framework hooks, always called on the main thread. }
     function BuildInputSchema: TJSONObject; virtual; abstract;
     /// Fill the controls. Raise EMCPToolError with a clear message on bad input.
-    procedure ApplyArguments(const Args: TJSONObject); virtual; abstract;
+    /// Partial (Fill): missing required parameters are accepted, everything
+    /// that can be checked is checked before the first write, and the
+    /// controls already written are put back when a value is refused.
+    procedure ApplyArguments(const Args: TJSONObject; Partial: Boolean); virtual; abstract;
+    /// Names of the required parameters whose control is empty now. Main
+    /// thread. None by default.
+    function EmptyRequired: TArray<string>; virtual;
     /// The form is open and enabled.
     function IsUsable: Boolean; virtual; abstract;
     procedure ShowActive(Value: Boolean); virtual; abstract;
     /// Programmatic click on the submit control (AutoSubmit).
     procedure ClickSubmit; virtual; abstract;
+    /// Brings the form in front of the user (restoring it when minimized).
+    /// Used by Fill; does nothing by default.
+    procedure BringToUser; virtual;
 
     /// Subclasses call these from their control hooks.
     procedure HandleSubmit;
@@ -81,6 +97,22 @@ type
     procedure Reject(const Msg: string);
     /// True while an agent call is waiting for this form to be submitted.
     function AgentInvoked: Boolean;
+    /// True when the form behind the tool is open and enabled: a call or a
+    /// Fill would work now. Main thread.
+    function Available: Boolean;
+    /// The input schema the tool is registered with, built now. The caller
+    /// frees it. Main thread.
+    function NewInputSchema: TJSONObject;
+    /// Fills the form like an agent call, without waiting for the submit and
+    /// without AutoSubmit: for an in-app assistant whose actions must return
+    /// at once. Required parameters may be left out (the user completes them
+    /// on screen); when a value is refused, the fields written before it are
+    /// put back (the error names any that could not be). Brings
+    /// the form forward and highlights it until the user submits or cancels
+    /// it. A pending agent call is left alone (the error says so). Returns the
+    /// names of the required parameters still empty. Raises EMCPToolError
+    /// with a message the model can act on. Main thread.
+    function Fill(const Args: TJSONObject): TArray<string>;
     /// The name the tool is registered under, '' when it is not registered.
     property RegisteredName: string read FRegisteredName;
   published
@@ -98,7 +130,8 @@ type
     /// How long a call waits for the user to submit, in ms.
     property SubmitTimeout: Cardinal read FSubmitTimeout write FSubmitTimeout default 300000;
     property OnSubmit: TMCPSubmitEvent read FOnSubmit write FOnSubmit;
-    /// toolactivated: the agent filled the form.
+    /// toolactivated: the agent filled the form. Also fired by Fill (an
+    /// in-app assistant), with AgentInvoked False and nothing pending.
     property OnToolActivated: TNotifyEvent read FOnToolActivated write FOnToolActivated;
     /// toolcancel: the user cancelled or the form closed during a call.
     property OnToolCancel: TNotifyEvent read FOnToolCancel write FOnToolCancel;
@@ -151,10 +184,18 @@ function MCPListItem(const Text: string; Checkable, Checked: Boolean): TJSONValu
 /// The error SetValue raises on a list or a grid.
 function MCPReadOnlyDataError(const Param: string): EMCPToolError;
 
+{ The form tools of the application (main thread). }
+
+/// The form tools registered right now, sorted by name.
+function MCPRegisteredFormTools: TArray<TMCPCustomFormTool>;
+/// The form tool registered under ToolName (the exact name, else the same
+/// name case apart), nil when none.
+function MCPFindFormTool(const ToolName: string): TMCPCustomFormTool;
+
 implementation
 
 uses
-  System.StrUtils, System.Math, System.Generics.Collections;
+  System.StrUtils, System.Math, System.Generics.Collections, System.Generics.Defaults;
 
 var
   // Live form tools (main thread only): a queued call checks it before
@@ -567,7 +608,8 @@ begin
     FPending.Reject('Superseded by a newer call.');
     FPending := nil;
   end;
-  ApplyArguments(Args);
+  ApplyArguments(Args, False);
+  FAssistFilled := False;
   A := ModelContext.NewAwaitable;
   FPending := A;
   ShowActive(True);
@@ -613,12 +655,67 @@ end;
 procedure TMCPCustomFormTool.ClearPending;
 begin
   FPending := nil;
+  FAssistFilled := False;
   ShowActive(False);
 end;
 
 function TMCPCustomFormTool.AgentInvoked: Boolean;
 begin
   Result := FPending <> nil;
+end;
+
+function TMCPCustomFormTool.Available: Boolean;
+begin
+  Result := (FRegisteredName <> '') and IsUsable;
+end;
+
+function TMCPCustomFormTool.NewInputSchema: TJSONObject;
+begin
+  Result := BuildInputSchema;
+  if Result = nil then
+    Result := TMCPSchema.Empty;
+end;
+
+procedure TMCPCustomFormTool.BringToUser;
+begin
+end;
+
+function TMCPCustomFormTool.EmptyRequired: TArray<string>;
+begin
+  Result := nil;
+end;
+
+function TMCPCustomFormTool.Fill(const Args: TJSONObject): TArray<string>;
+begin
+  if FRegisteredName = '' then
+    raise EMCPToolError.CreateFmt('The tool "%s" is not active.', [FToolName]);
+  if not IsUsable then
+    raise EMCPToolError.CreateFmt('The form behind "%s" is not open right now. ' +
+      'Ask the user to open it, then try again.', [FToolName]);
+  if FPending <> nil then
+    raise EMCPToolError.CreateFmt('The form behind "%s" is waiting for the user to ' +
+      'submit values another agent filled in. Try again once it is submitted or cancelled.',
+      [FToolName]);
+  ApplyArguments(Args, True);
+  FAssistFilled := True;
+  try
+    BringToUser;
+  except
+    // a window that refuses to come forward is not a reason to fail the fill
+  end;
+  ShowActive(True);
+  if Assigned(FOnToolActivated) then
+    FOnToolActivated(Self);
+  Result := EmptyRequired;
+end;
+
+procedure TMCPCustomFormTool.EndAssistFill;
+begin
+  if FAssistFilled then
+  begin
+    FAssistFilled := False;
+    ShowActive(False);
+  end;
 end;
 
 procedure TMCPCustomFormTool.HandleSubmit;
@@ -631,7 +728,10 @@ begin
     FOnSubmit(Self, AgentInvoked, Response);
   P := FPending; // nil if OnSubmit called Reject
   if P = nil then
+  begin
+    EndAssistFill;
     Exit;
+  end;
   ClearPending;
   if Response = '' then
     Response := 'The form was submitted.';
@@ -644,7 +744,10 @@ var
 begin
   P := FPending;
   if P = nil then
+  begin
+    EndAssistFill;
     Exit;
+  end;
   ClearPending;
   if Assigned(FOnToolCancel) then
     FOnToolCancel(Self);
@@ -660,6 +763,42 @@ begin
     Exit;
   ClearPending;
   P.Reject(Msg);
+end;
+
+{ The form tools of the application }
+
+function MCPRegisteredFormTools: TArray<TMCPCustomFormTool>;
+var
+  O: TObject;
+  List: TList<TMCPCustomFormTool>;
+begin
+  List := TList<TMCPCustomFormTool>.Create;
+  try
+    for O in GAliveTools do
+      if TMCPCustomFormTool(O).RegisteredName <> '' then
+        List.Add(TMCPCustomFormTool(O));
+    List.Sort(TComparer<TMCPCustomFormTool>.Construct(
+      function(const L, R: TMCPCustomFormTool): Integer
+      begin
+        Result := CompareText(L.RegisteredName, R.RegisteredName);
+      end));
+    Result := List.ToArray;
+  finally
+    List.Free;
+  end;
+end;
+
+function MCPFindFormTool(const ToolName: string): TMCPCustomFormTool;
+var
+  T: TMCPCustomFormTool;
+begin
+  Result := nil;
+  // exact name first: MCP names are case-sensitive
+  for T in MCPRegisteredFormTools do
+    if T.RegisteredName = Trim(ToolName) then
+      Exit(T)
+    else if (Result = nil) and SameText(T.RegisteredName, Trim(ToolName)) then
+      Result := T;
 end;
 
 initialization

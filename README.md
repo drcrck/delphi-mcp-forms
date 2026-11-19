@@ -47,8 +47,8 @@ end;
 For the order form in `Demos/VCL`, `tools/list` returns:
 
 ```json
-{ "name": "create-order",
-  "inputSchema": { "type": "object", "properties": {
+{ "name": "create-order", "title": "New order",
+  "inputSchema": { "type": "object", "required": ["customer", "product"], "properties": {
     "customer":  { "type": "string",  "description": "Customer company name" },
     "product":   { "type": "string",  "enum": ["Espresso machine", "Coffee grinder", "Milk frother", "Descaling kit"] },
     "quantity":  { "type": "integer", "minimum": 1, "maximum": 100 },
@@ -56,6 +56,8 @@ For the order form in `Demos/VCL`, `tools/list` returns:
     "giftWrap":  { "type": "boolean", "description": "Gift wrap" },
     "notes":     { "type": "string",  "description": "Notes" } } } }
 ```
+
+The demo lists its controls in `Params`, with `Required` on customer and product (`FOrderTool.Params.Add(edtCustomer, '', '', True)`), and sets `ToolTitle`. Without `Params`, every input control of the container is a parameter and none is required. A `tools/call` without a required parameter is refused before the form is touched.
 
 ## Connect a client
 
@@ -256,6 +258,34 @@ How it calls the API:
 
 WebView2 needs `WebView2Loader.dll` (x86, from the `Microsoft.Web.WebView2` NuGet package, or the *EdgeView2 SDK* in GetIt) next to the executable, and the WebView2 runtime, which Windows 10 and 11 include. `build.bat` copies the DLL when `WEBVIEW2_LOADER` points to it.
 
+## In-app assistant: HelpChatAI
+
+[HelpChatAI](https://github.com/EtheaDev/Delphi-HelpChatAI) by Carlo Barazzetta (Apache 2.0) is a complete in-app assistant for VCL and FireMonkey: a chat bubble, F1, answers from the application's own manual, several models and providers. What it can do in the application are *actions*, and ready-made sets of actions are *skills*, turned on by name in `Settings.Skills`. Its own skills work on the window in front of the user: `forms` reads and fills its fields, `commands` presses its buttons, `records` and `pages` find a record and change tab.
+
+`MCPForms.HelpChatAI` adds a skill named `mcpforms`, which brings it the form tools declared with delphi-mcp-forms:
+
+```pascal
+uses MCPForms.HelpChatAI;   // registers the "mcpforms" skill
+
+HelpChat.Settings.Skills := 'forms, commands, mcpforms';
+```
+
+| Action | What it does |
+|---|---|
+| `mcp_list_forms` | every form tool of the application, open or not: name, title, whether it is open now, what it is for |
+| `mcp_describe_form(form)` | its fields from the tool's JSON Schema: label, type, allowed values, range, required |
+| `mcp_fill_form(form, values)` | asks the user to confirm the values, fills the form, brings it forward and highlights it |
+
+How it relates to the `forms` skill:
+
+- `forms` reads the controls of the window on screen, whatever it is: no declaration needed, and it is the right one for a window nobody wrote a form tool for.
+- `mcpforms` reads what the developer declared once for every MCP client: the description, the names, the enums, the ranges and the required fields of `TMCPFormTool`, and it knows the forms that are not open, so the assistant can say which one to open and what it will ask. Nothing has to be described again for the assistant.
+- The action names differ (`mcp_fill_form`, not `fill_form`), so both skills can be on together. Its actions are the same three whatever forms are open, so the list of tools does not change and HelpChatAI's prompt caching keeps working.
+
+Like HelpChatAI's skills, `mcp_fill_form` **asks first and never saves**: the user sees the values in HelpChatAI's confirmation, the form is filled and highlighted, and the user reviews it and clicks *Save*. A form that is not open is not filled: the assistant asks the user to open it. Unlike a `tools/call`, the assistant may fill a form with required fields still missing: the user is in front of it and completes them, and the assistant is told which ones are still empty. The submit handler validates on *Save* as usual.
+
+`Demos/HelpChatAI` is the VCL order demo with a `TVclHelpChatAI`: the Claude provider (set `ANTHROPIC_API_KEY`; the key is in no file), a two-page manual in `Help/`, and the skills `forms, commands, mcpforms`. Build it with `build_helpchat.bat`, with `HELPCHATAI` pointing to the HelpChatAI repository and `MARKDOWN` to [MarkdownProcessor](https://github.com/EtheaDev/MarkdownProcessor), which HelpChatAI needs. The script also builds the documentation index of `Help/` and copies `WebView2Loader.dll` and the manual next to the executable. `build.bat` does not need HelpChatAI.
+
 ## How a declarative call runs
 
 1. The client calls `tools/call create-order {...}`. Indy handles it on a worker thread.
@@ -297,6 +327,7 @@ WebView2 needs `WebView2Loader.dll` (x86, from the `Microsoft.Web.WebView2` NuGe
 | `MCPForms.VCL.DB` | reads `TDBGrid` in screen snapshots. Optional: it links `Data.DB`. |
 | `MCPForms.VCL.DBGridEh` | reads `TDBGridEh` (EhLib) in screen snapshots. Optional: it needs EhLib. |
 | `MCPForms.Screen` | screen snapshots as JSON Forms, the `form://` resources and the `read-screen` tool. Framework-neutral: the VCL and FMX units register the readers. |
+| `MCPForms.HelpChatAI` | the `mcpforms` skill of [HelpChatAI](https://github.com/EtheaDev/Delphi-HelpChatAI). Optional: it needs HelpChatAI. |
 
 `TModelContext.HandleMessage(Request): Response` is the whole endpoint as a function, so another transport (named pipes, for example) takes only a few lines.
 
@@ -307,8 +338,9 @@ WebView2 needs `WebView2Loader.dll` (x86, from the `Microsoft.Web.WebView2` NuGe
 - `Demos/VCL`: order entry, port 8765 and WM_COPYDATA. Declarative `create-order`, plus `list-orders` (read-only) and `delete-order` (consequential, asks for confirmation).
 - `Demos/FMX`: room booking, port 8766 and WM_COPYDATA. Declarative `book-room` with `AutoSubmit`, plus `list-bookings`.
 - `Demos/Assistant`: the VCL order demo with a `TMCPChatPanel` on the right. Set `ANTHROPIC_API_KEY` before starting it.
+- `Demos/HelpChatAI`: the VCL order demo with HelpChatAI and the `mcpforms` skill. Set `ANTHROPIC_API_KEY` before starting it.
 
-Build them with `build.bat`, or open the `.dpr` files in the IDE. Every demo also publishes the `form://` resources and `read-screen`.
+Build them with `build.bat` (`build_helpchat.bat` for the HelpChatAI demo), or open the `.dpr` files in the IDE. Every demo also publishes the `form://` resources and `read-screen`.
 
 ## License
 

@@ -47,8 +47,8 @@ end;
 Per la form ordini di `Demos/VCL`, `tools/list` restituisce:
 
 ```json
-{ "name": "create-order",
-  "inputSchema": { "type": "object", "properties": {
+{ "name": "create-order", "title": "New order",
+  "inputSchema": { "type": "object", "required": ["customer", "product"], "properties": {
     "customer":  { "type": "string",  "description": "Customer company name" },
     "product":   { "type": "string",  "enum": ["Espresso machine", "Coffee grinder", "Milk frother", "Descaling kit"] },
     "quantity":  { "type": "integer", "minimum": 1, "maximum": 100 },
@@ -56,6 +56,8 @@ Per la form ordini di `Demos/VCL`, `tools/list` restituisce:
     "giftWrap":  { "type": "boolean", "description": "Gift wrap" },
     "notes":     { "type": "string",  "description": "Notes" } } } }
 ```
+
+La demo elenca i suoi controlli in `Params`, con `Required` su cliente e prodotto (`FOrderTool.Params.Add(edtCustomer, '', '', True)`), e imposta `ToolTitle`. Senza `Params`, ogni controllo di input del contenitore è un parametro e nessuno è obbligatorio. Una `tools/call` senza un parametro obbligatorio viene rifiutata prima di toccare la form.
 
 Le descrizioni che l'agente legge (nome e descrizione della tool, testi dei parametri) è meglio scriverle in inglese: i modelli le seguono in modo più affidabile.
 
@@ -258,6 +260,34 @@ Come chiama le API:
 
 WebView2 richiede `WebView2Loader.dll` (x86, dal pacchetto NuGet `Microsoft.Web.WebView2`, oppure *EdgeView2 SDK* in GetIt) accanto all'eseguibile, e il runtime WebView2, che Windows 10 e 11 includono. `build.bat` copia la DLL quando `WEBVIEW2_LOADER` punta a lei.
 
+## Assistente nell'applicazione: HelpChatAI
+
+[HelpChatAI](https://github.com/EtheaDev/Delphi-HelpChatAI) di Carlo Barazzetta (Apache 2.0) è un assistente completo per applicazioni VCL e FireMonkey: una bolla di chat, F1, risposte tratte dal manuale dell'applicazione, più modelli e più provider. Quello che può fare nell'applicazione sono le *azioni*, e gruppi di azioni già pronti sono le *skill*, che si attivano per nome in `Settings.Skills`. Le sue skill lavorano sulla finestra che l'utente ha davanti: `forms` ne legge e compila i campi, `commands` ne preme i pulsanti, `records` e `pages` trovano un record e cambiano scheda.
+
+`MCPForms.HelpChatAI` aggiunge una skill chiamata `mcpforms`, che gli porta le form tool dichiarate con delphi-mcp-forms:
+
+```pascal
+uses MCPForms.HelpChatAI;   // registra la skill "mcpforms"
+
+HelpChat.Settings.Skills := 'forms, commands, mcpforms';
+```
+
+| Azione | Cosa fa |
+|---|---|
+| `mcp_list_forms` | tutte le form tool dell'applicazione, aperte o no: nome, titolo, se è aperta ora, a cosa serve |
+| `mcp_describe_form(form)` | i suoi campi presi dal JSON Schema della tool: etichetta, tipo, valori ammessi, intervallo, obbligatorietà |
+| `mcp_fill_form(form, values)` | chiede all'utente di confermare i valori, compila la form, la porta in primo piano e la evidenzia |
+
+Come si affianca alla skill `forms`:
+
+- `forms` legge i controlli della finestra sullo schermo, qualunque sia: non serve dichiarare nulla, ed è quella giusta per una finestra per cui nessuno ha scritto una form tool.
+- `mcpforms` legge quello che lo sviluppatore ha dichiarato una volta per tutti i client MCP: la descrizione, i nomi, gli enum, gli intervalli e i campi obbligatori di `TMCPFormTool`, e conosce anche le form non aperte, quindi l'assistente può dire quale aprire e cosa chiederà. Non c'è niente da descrivere di nuovo per l'assistente.
+- I nomi delle azioni sono diversi (`mcp_fill_form`, non `fill_form`), quindi le due skill possono essere attive insieme. Le azioni sono sempre le stesse tre, qualunque form sia aperta, così l'elenco delle tool non cambia e il prompt caching di HelpChatAI continua a funzionare.
+
+Come le skill di HelpChatAI, `mcp_fill_form` **chiede prima e non salva mai**: l'utente vede i valori nella conferma di HelpChatAI, la form viene compilata ed evidenziata, e l'utente la controlla e clicca *Salva*. Una form non aperta non viene compilata: l'assistente chiede all'utente di aprirla. A differenza di una `tools/call`, l'assistente può compilare una form lasciando vuoti campi obbligatori: l'utente ce l'ha davanti e li completa, e l'assistente sa quali sono ancora vuoti. Il gestore di invio valida al *Salva* come sempre.
+
+`Demos/HelpChatAI` è la demo ordini VCL con un `TVclHelpChatAI`: il provider Claude (va impostata `ANTHROPIC_API_KEY`; la chiave non sta in nessun file), un manuale di due pagine in `Help/` e le skill `forms, commands, mcpforms`. Si compila con `build_helpchat.bat`, con `HELPCHATAI` che punta al repository di HelpChatAI e `MARKDOWN` a [MarkdownProcessor](https://github.com/EtheaDev/MarkdownProcessor), che serve a HelpChatAI. Lo script costruisce anche l'indice della documentazione di `Help/` e copia `WebView2Loader.dll` e il manuale accanto all'eseguibile. `build.bat` non ha bisogno di HelpChatAI.
+
 ## Come si svolge una chiamata dichiarativa
 
 1. Il client chiama `tools/call create-order {...}`. La richiesta viene gestita su un thread secondario.
@@ -299,6 +329,7 @@ WebView2 richiede `WebView2Loader.dll` (x86, dal pacchetto NuGet `Microsoft.Web.
 | `MCPForms.VCL.DB` | legge `TDBGrid` nella fotografia dello schermo. Facoltativa: include `Data.DB`. |
 | `MCPForms.VCL.DBGridEh` | legge `TDBGridEh` (EhLib) nella fotografia dello schermo. Facoltativa: richiede EhLib. |
 | `MCPForms.Screen` | fotografia dello schermo in JSON Forms, resources `form://` e tool `read-screen`. Indipendente dal framework: i lettori li registrano le unit VCL e FMX. |
+| `MCPForms.HelpChatAI` | la skill `mcpforms` di [HelpChatAI](https://github.com/EtheaDev/Delphi-HelpChatAI). Facoltativa: richiede HelpChatAI. |
 
 `TModelContext.HandleMessage(Request): Response` è l'intero endpoint sotto forma di funzione, quindi un altro trasporto (per esempio le named pipe) richiede poche righe.
 
@@ -309,8 +340,9 @@ WebView2 richiede `WebView2Loader.dll` (x86, dal pacchetto NuGet `Microsoft.Web.
 - `Demos/VCL`: inserimento ordini, porta 8765 e WM_COPYDATA. Tool dichiarativa `create-order`, più `list-orders` (sola lettura) e `delete-order` (con conferma dell'utente).
 - `Demos/FMX`: prenotazione camere, porta 8766 e WM_COPYDATA. Tool dichiarativa `book-room` con `AutoSubmit`, più `list-bookings`.
 - `Demos/Assistant`: la demo ordini VCL con un `TMCPChatPanel` a destra. Prima di avviarla va impostata `ANTHROPIC_API_KEY`.
+- `Demos/HelpChatAI`: la demo ordini VCL con HelpChatAI e la skill `mcpforms`. Prima di avviarla va impostata `ANTHROPIC_API_KEY`.
 
-Si compilano con `build.bat`, oppure aprendo i file `.dpr` nell'IDE. Tutte le demo pubblicano anche le resources `form://` e `read-screen`.
+Si compilano con `build.bat` (`build_helpchat.bat` per la demo HelpChatAI), oppure aprendo i file `.dpr` nell'IDE. Tutte le demo pubblicano anche le resources `form://` e `read-screen`.
 
 ## Licenza
 

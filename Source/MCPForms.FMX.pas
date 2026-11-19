@@ -44,6 +44,11 @@ type
     /// value"), or nil when the adapter cannot read it. Used by the screen
     /// snapshots of MCPForms.Screen; optional for third-party adapters.
     function GetValue(C: TControl): TJSONValue; virtual;
+    /// Puts back a value GetValue read, when an assistant fill is rolled back
+    /// (never used for an agent's arguments). TJSONNull is the empty state.
+    /// False when it cannot. The default writes a non-null value with
+    /// SetValue and cannot restore null.
+    function RestoreValue(C: TControl; Saved: TJSONValue): Boolean; virtual;
     /// A list or a grid: read by screen snapshots (GetValue returns an
     /// array, at most MCPScreenMaxRows rows), never a form tool parameter.
     function IsDataView(C: TControl): Boolean; virtual;
@@ -105,10 +110,12 @@ type
     procedure Loaded; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
     function BuildInputSchema: TJSONObject; override;
-    procedure ApplyArguments(const Args: TJSONObject); override;
+    procedure ApplyArguments(const Args: TJSONObject; Partial: Boolean); override;
+    function EmptyRequired: TArray<string>; override;
     function IsUsable: Boolean; override;
     procedure ShowActive(Value: Boolean); override;
     procedure ClickSubmit; override;
+    procedure BringToUser; override;
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -196,6 +203,18 @@ begin
   Result := nil;
 end;
 
+function TMCPControlAdapter.RestoreValue(C: TControl; Saved: TJSONValue): Boolean;
+begin
+  if (Saved = nil) or (Saved is TJSONNull) then
+    Exit(False);
+  try
+    SetValue(C, '', Saved);
+    Result := True;
+  except
+    Result := False;
+  end;
+end;
+
 function TMCPControlAdapter.IsDataView(C: TControl): Boolean;
 begin
   Result := False;
@@ -255,6 +274,7 @@ type
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
     function GetValue(C: TControl): TJSONValue; override;
+    function RestoreValue(C: TControl; Saved: TJSONValue): Boolean; override;
   end;
 
   TCheckAdapter = class(TMCPControlAdapter)
@@ -277,6 +297,7 @@ type
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
     function GetValue(C: TControl): TJSONValue; override;
+    function RestoreValue(C: TControl; Saved: TJSONValue): Boolean; override;
   end;
 
   TTimeEditAdapter = class(TMCPControlAdapter)
@@ -284,6 +305,7 @@ type
     function Schema(C: TControl): TJSONObject; override;
     procedure SetValue(C: TControl; const Param: string; Value: TJSONValue); override;
     function GetValue(C: TControl): TJSONValue; override;
+    function RestoreValue(C: TControl; Saved: TJSONValue): Boolean; override;
   end;
 
 { TEditAdapter }
@@ -450,6 +472,14 @@ begin
     Result := TJSONNull.Create;
 end;
 
+function TComboBoxAdapter.RestoreValue(C: TControl; Saved: TJSONValue): Boolean;
+begin
+  if not (Saved is TJSONNull) then
+    Exit(inherited);
+  TCustomComboBox(C).ItemIndex := -1;
+  Result := True;
+end;
+
 { TCheckAdapter }
 
 function TCheckAdapter.Supports(C: TControl): Boolean;
@@ -542,6 +572,17 @@ begin
     Result := TJSONString.Create(FormatDateTime('yyyy"-"mm"-"dd', D.Date));
 end;
 
+function TDateEditAdapter.RestoreValue(C: TControl; Saved: TJSONValue): Boolean;
+begin
+  if not (Saved is TJSONNull) then
+    Exit(inherited);
+  if TCustomDateEdit(C).ShowCheckBox then
+    TCustomDateEdit(C).IsChecked := False
+  else
+    TCustomDateEdit(C).IsEmpty := True;
+  Result := True;
+end;
+
 { TTimeEditAdapter }
 
 function TTimeEditAdapter.Supports(C: TControl): Boolean;
@@ -569,6 +610,17 @@ begin
     Result := TJSONNull.Create
   else
     Result := TJSONString.Create(FormatDateTime('hh":"nn":"ss', T.Time));
+end;
+
+function TTimeEditAdapter.RestoreValue(C: TControl; Saved: TJSONValue): Boolean;
+begin
+  if not (Saved is TJSONNull) then
+    Exit(inherited);
+  if TCustomTimeEdit(C).ShowCheckBox then
+    TCustomTimeEdit(C).IsChecked := False
+  else
+    TCustomTimeEdit(C).IsEmpty := True;
+  Result := True;
 end;
 
 { Lists and grids }
@@ -1179,13 +1231,20 @@ begin
     Req.Free;
 end;
 
-procedure TMCPFormTool.ApplyArguments(const Args: TJSONObject);
+procedure TMCPFormTool.ApplyArguments(const Args: TJSONObject; Partial: Boolean);
+type
+  TUndo = TPair<TParamInfo, TJSONValue>;
 var
   Params: TArray<TParamInfo>;
   P: TParamInfo;
   Pair: TJSONPair;
   Known: Boolean;
   Missing: string;
+  Undo: TList<TUndo>;
+  I: Integer;
+  Saved: TJSONValue;
+  Restored: Boolean;
+  NotRestored: string;
 begin
   Params := ResolveParams(Self, EffectiveContainer);
   for Pair in Args do
@@ -1197,19 +1256,97 @@ begin
     if not Known then
       raise EMCPToolError.CreateFmt('Unknown parameter "%s".', [Pair.JsonString.Value]);
   end;
-  Missing := '';
-  for P in Params do
-    if P.Required and (Args.GetValue(P.Name) = nil) then
-      Missing := Missing + ' "' + P.Name + '"';
-  if Missing <> '' then
-    raise EMCPToolError.Create('Missing required parameter(s):' + Missing + '.');
+  if not Partial then
+  begin
+    Missing := '';
+    for P in Params do
+      if P.Required and (Args.GetValue(P.Name) = nil) then
+        Missing := Missing + ' "' + P.Name + '"';
+    if Missing <> '' then
+      raise EMCPToolError.Create('Missing required parameter(s):' + Missing + '.');
 
+    for P in Params do
+      if Args.GetValue(P.Name) <> nil then
+      begin
+        if not P.Control.Enabled then
+          raise EMCPToolError.CreateFmt('Parameter "%s" cannot be changed right now.', [P.Name]);
+        P.Adapter.SetValue(P.Control, P.Name, Args.GetValue(P.Name));
+      end;
+    Exit;
+  end;
+
+  // Partial (Fill): what can be checked without writing is checked first...
   for P in Params do
-    if Args.GetValue(P.Name) <> nil then
+    if (Args.GetValue(P.Name) <> nil) and not P.Control.Enabled then
+      raise EMCPToolError.CreateFmt('Parameter "%s" cannot be changed right now.', [P.Name]);
+  // ...and the conversion of each value happens in SetValue: when one is
+  // refused, the controls written before it get their previous value back.
+  Undo := TList<TUndo>.Create;
+  try
+    try
+      for P in Params do
+        if Args.GetValue(P.Name) <> nil then
+        begin
+          Saved := P.Adapter.GetValue(P.Control);
+          try
+            P.Adapter.SetValue(P.Control, P.Name, Args.GetValue(P.Name));
+          except
+            Saved.Free; // refused: this control was not written
+            raise;
+          end;
+          Undo.Add(TUndo.Create(P, Saved));
+        end;
+    except
+      on E: Exception do
+      begin
+        NotRestored := '';
+        for I := Undo.Count - 1 downto 0 do
+        begin
+          Restored := False;
+          try
+            Restored := Undo[I].Key.Adapter.RestoreValue(Undo[I].Key.Control, Undo[I].Value);
+          except
+            // reported below
+          end;
+          if not Restored then
+          begin
+            if NotRestored <> '' then
+              NotRestored := ', ' + NotRestored;
+            NotRestored := '"' + Undo[I].Key.Name + '"' + NotRestored;
+          end;
+        end;
+        if NotRestored = '' then
+          raise;
+        raise EMCPToolError.Create(E.Message + ' Nothing else was changed, but these ' +
+          'fields keep the new value and could not be put back: ' + NotRestored + '.');
+      end;
+    end;
+  finally
+    for I := 0 to Undo.Count - 1 do
+      Undo[I].Value.Free;
+    Undo.Free;
+  end;
+end;
+
+function TMCPFormTool.EmptyRequired: TArray<string>;
+var
+  P: TParamInfo;
+  V: TJSONValue;
+begin
+  Result := nil;
+  if EffectiveContainer = nil then
+    Exit;
+  for P in ResolveParams(Self, EffectiveContainer) do
+    if P.Required then
     begin
-      if not P.Control.Enabled then
-        raise EMCPToolError.CreateFmt('Parameter "%s" cannot be changed right now.', [P.Name]);
-      P.Adapter.SetValue(P.Control, P.Name, Args.GetValue(P.Name));
+      V := P.Adapter.GetValue(P.Control);
+      try
+        // nil: the adapter cannot tell, so it is not reported
+        if (V is TJSONNull) or ((V is TJSONString) and (Trim(V.Value) = '')) then
+          Result := Result + [P.Name];
+      finally
+        V.Free;
+      end;
     end;
 end;
 
@@ -1247,6 +1384,25 @@ begin
   FFrame.Stroke.Color := FHighlightColor;
   FFrame.Stroke.Thickness := 3;
   FFrame.BringToFront;
+end;
+
+procedure TMCPFormTool.BringToUser;
+var
+  C: TFmxObject;
+  F: TCommonCustomForm;
+begin
+  C := EffectiveContainer;
+  F := nil;
+  if C is TCommonCustomForm then
+    F := TCommonCustomForm(C)
+  else if (C is TControl) and (TControl(C).Root <> nil) and
+          (TControl(C).Root.GetObject is TCommonCustomForm) then
+    F := TCommonCustomForm(TControl(C).Root.GetObject);
+  if F = nil then
+    Exit;
+  if F.WindowState = TWindowState.wsMinimized then
+    F.WindowState := TWindowState.wsNormal;
+  F.BringToFront;
 end;
 
 procedure TMCPFormTool.ClickSubmit;
